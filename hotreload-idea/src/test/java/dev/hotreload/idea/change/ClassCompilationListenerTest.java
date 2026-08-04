@@ -149,6 +149,39 @@ class ClassCompilationListenerTest {
         assertTrue(reloaded.isEmpty());
     }
 
+    @Test void fansOneGeneratedClassOutToEveryMatchingDebugLaunch() throws Exception {
+        Path output = createClass("shared-output", "demo/Shared.class", new byte[]{7});
+        List<String> launches = new ArrayList<String>();
+        ClassCompilationListener listener = new ClassCompilationListener(
+                new ClassCompilationListener.SessionOperations() {
+                    @Override public boolean isJavaReloadEnabled() { return true; }
+
+                    @Override public String activeDebugLaunchForOutput(Path outputRoot) {
+                        return null;
+                    }
+
+                    @Override public List<String> activeDebugLaunchesForClass(
+                            Path outputRoot, String relativePath) {
+                        assertEquals(output, outputRoot);
+                        return java.util.Arrays.asList("launch-a", "launch-b");
+                    }
+
+                    @Override public void recordWarning(String event, String reason) {
+                        throw new AssertionError(event + ":" + reason);
+                    }
+
+                    @Override public void reloadClasses(String launchId, List<ClassUpdate> updates) {
+                        launches.add(launchId);
+                        assertEquals("demo.Shared", updates.get(0).getBinaryName());
+                    }
+                });
+
+        listener.fileGenerated(output.toString(), "demo/Shared.class");
+        listener.compilationFinished(false, 0, 0, null);
+
+        assertEquals(java.util.Arrays.asList("launch-a", "launch-b"), launches);
+    }
+
     private Path createClass(String directory, String relativePath, byte[] content) throws Exception {
         Path root = tempDirectory.resolve(directory);
         Path classFile = root.resolve(relativePath);

@@ -1,5 +1,6 @@
 package dev.hotreload.agent.configreload;
 
+import dev.hotreload.protocol.message.OperationStatus;
 import dev.hotreload.protocol.message.ResourceReloadRequest;
 import org.junit.jupiter.api.Test;
 
@@ -155,6 +156,39 @@ class ConfigResourceReloaderTest {
         assertEquals(Collections.singletonList("hotreload:application.yml"), sources.names());
     }
 
+    @Test
+    void failedOriginalRemovalRestoresExactPropertySourcesAndOrder() {
+        FakeMapPropertySource first = new FakeMapPropertySource(
+                "Config resource 'class path resource [application.yml]'");
+        FakeMapPropertySource second = new FakeMapPropertySource(
+                "Config resource 'class path resource [config/application.yml]'");
+        FakeMutablePropertySources sources = new FakeMutablePropertySources(first, second);
+        sources.failNextRemove(second.getName());
+        FakeMapPropertySource replacement = new FakeMapPropertySource("hotreload:application.yml");
+
+        String result = ConfigResourceReloader.installReloadedPropertySource(
+                sources, replacement.getName(), replacement, null,
+                Arrays.asList(first.getName(), second.getName()), 2);
+
+        assertTrue(result.contains("localRollback=ok"), result);
+        assertEquals(Arrays.asList(first.getName(), second.getName()), sources.names());
+        assertSame(first, sources.get(first.getName()));
+        assertSame(second, sources.get(second.getName()));
+        assertFalse(sources.names().contains(replacement.getName()));
+    }
+
+    @Test
+    void rollbackFailureRequiresRestart() {
+        assertEquals(OperationStatus.RESTART_REQUIRED,
+                ConfigResourceReloader.transactionStatus(1, 1, true));
+        assertEquals(OperationStatus.FAILED,
+                ConfigResourceReloader.transactionStatus(1, 1, false));
+        assertEquals(OperationStatus.SUCCESS,
+                ConfigResourceReloader.transactionStatus(0, 1, false));
+        assertEquals(OperationStatus.SKIPPED,
+                ConfigResourceReloader.transactionStatus(0, 0, false));
+    }
+
     private abstract static class FakePropertySource {
         private final String name;
 
@@ -178,6 +212,7 @@ class ConfigResourceReloaderTest {
         private int addFirstCalls;
         private int replaceCalls;
         private int removeCalls;
+        private String failRemoveName;
 
         private FakeMutablePropertySources(FakePropertySource... initial) {
             if (initial != null) {
@@ -221,6 +256,10 @@ class ConfigResourceReloaderTest {
         }
 
         public FakePropertySource remove(String name) {
+            if (name.equals(failRemoveName)) {
+                failRemoveName = null;
+                throw new IllegalStateException("injected remove failure");
+            }
             FakePropertySource removed = values.remove(name);
             if (removed == current) current = null;
             removeCalls++;
@@ -229,6 +268,14 @@ class ConfigResourceReloaderTest {
 
         private List<String> names() {
             return new ArrayList<String>(values.keySet());
+        }
+
+        private FakePropertySource get(String name) {
+            return values.get(name);
+        }
+
+        private void failNextRemove(String name) {
+            failRemoveName = name;
         }
 
         @Override public Iterator<FakePropertySource> iterator() {

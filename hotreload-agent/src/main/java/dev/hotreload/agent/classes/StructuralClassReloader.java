@@ -135,6 +135,10 @@ public final class StructuralClassReloader {
         // Prefer assignable subclass to avoid "Foo cannot be cast to Foo" across loaders.
         try {
             Class<?> base = resolveBaseType(loaded);
+            String incompatible = generationIncompatibility(analysis);
+            if (incompatible != null) {
+                return new Result(loaded, "failed", incompatible + ",reason=" + reason, false);
+            }
             StructureSubclassFactory.Built built = StructureSubclassFactory.build(base, bytecode);
             ClassLoader parent = base.getClassLoader();
             GenerationClassLoader gen = new GenerationClassLoader(parent, built.binaryName, built.bytecode);
@@ -143,10 +147,10 @@ public final class StructuralClassReloader {
                 return new Result(loaded, "failed",
                         "generation_not_assignable:" + next.getName() + "!->" + base.getName(), false);
             }
-            try {
-                RuntimeAnnotationIndex.update(next, built.bytecode);
-                RuntimeAnnotationPatcher.patch(next, built.bytecode);
-            } catch (Throwable ignored) {
+            String annotationFailure = initializeAnnotationState(next, built.bytecode);
+            if (annotationFailure != null) {
+                return new Result(next, "failed", "generation_" + annotationFailure
+                        + ",reason=" + reason, false);
             }
             // Registry key stays the original binary name so subsequent reloads resolve the live type.
             HotReloadClassRegistry.put(base.getName(), next);
@@ -159,32 +163,9 @@ public final class StructuralClassReloader {
                             + ",bridgedMethods=" + built.bridgedMethods
                             + ",reason=" + reason, true);
         } catch (Throwable subclassFailed) {
-            // Last resort: same-name generation (may ClassCast in Spring). Prefer failure clarity.
-            return defineSameNameGeneration(loaded, bytecode, reason + "|subclass_failed:"
-                    + rootName(subclassFailed) + ":" + rootMessage(subclassFailed));
-        }
-    }
-
-    private Result defineSameNameGeneration(Class<?> loaded, byte[] bytecode, String reason) {
-        try {
-            ClassLoader parent = loaded.getClassLoader();
-            if (parent instanceof GenerationClassLoader) {
-                parent = parent.getParent();
-            }
-            GenerationClassLoader gen = new GenerationClassLoader(parent, loaded.getName(), bytecode);
-            Class<?> next = gen.defineTarget();
-            try {
-                RuntimeAnnotationIndex.update(next, bytecode);
-                RuntimeAnnotationPatcher.patch(next, bytecode);
-            } catch (Throwable ignored) {
-            }
-            HotReloadClassRegistry.put(loaded.getName(), next);
-            return new Result(next, "generation", "loader=" + gen.getTag()
-                    + ",gen=" + HotReloadClassRegistry.generation(loaded.getName())
-                    + ",subclass=false,assignable=false,reason=" + reason, true);
-        } catch (Throwable failure) {
-            return new Result(loaded, "failed", "generation_failed:" + rootName(failure)
-                    + ":" + rootMessage(failure), false);
+            return new Result(loaded, "failed", "assignable_generation_failed:"
+                    + rootName(subclassFailed) + ":" + rootMessage(subclassFailed)
+                    + ",reason=" + reason, false);
         }
     }
 
@@ -215,27 +196,48 @@ public final class StructuralClassReloader {
     }
 
     public Result defineNew(String binaryName, byte[] bytecode) {
+        Class<?> defined = null;
         try {
-            Class<?> defined = NewClassDefiner.define(binaryName, bytecode, instrumentation);
-            RuntimeAnnotationIndex.update(defined, bytecode);
-            RuntimeAnnotationPatcher.patch(defined, bytecode);
+            defined = NewClassDefiner.define(binaryName, bytecode, instrumentation);
+            String annotationFailure = initializeAnnotationState(defined, bytecode);
+            if (annotationFailure != null) {
+                return new Result(defined, "failed", "new_class_" + annotationFailure, false);
+            }
             HotReloadClassRegistry.put(binaryName, defined);
             return new Result(defined, "defined", "new_class", true);
-        } catch (Throwable first) {
-            try {
-                ClassLoader parent = Thread.currentThread().getContextClassLoader();
-                if (parent == null) parent = ClassLoader.getSystemClassLoader();
-                GenerationClassLoader gen = new GenerationClassLoader(parent, binaryName, bytecode);
-                Class<?> defined = gen.defineTarget();
-                RuntimeAnnotationIndex.update(defined, bytecode);
-                RuntimeAnnotationPatcher.patch(defined, bytecode);
-                HotReloadClassRegistry.put(binaryName, defined);
-                return new Result(defined, "defined", "generation_define:" + gen.getTag(), true);
-            } catch (Throwable second) {
-                return new Result(null, "failed", "define_failed:" + rootName(first)
-                        + "/" + rootName(second), false);
-            }
+        } catch (Throwable failure) {
+            return new Result(defined, "failed", "define_in_application_loader_failed:"
+                    + rootName(failure) + ":" + rootMessage(failure), false);
         }
+    }
+
+    private static String initializeAnnotationState(Class<?> type, byte[] bytecode) {
+        try {
+            RuntimeAnnotationIndex.update(type, bytecode);
+            RuntimeAnnotationPatcher.PatchReport patch = RuntimeAnnotationPatcher.patch(type, bytecode);
+            return patch.isComplete() ? null : "annotation_patch_incomplete:" + patch.summary();
+        } catch (Throwable failure) {
+            return "annotation_initialization_failed:" + rootName(failure)
+                    + ":" + rootMessage(failure);
+        }
+    }
+
+    private static String generationIncompatibility(ClassChangeAnalyzer.Analysis analysis) {
+        if (analysis == null || analysis.getBefore() == null || analysis.getAfter() == null) {
+            return "generation_shape_unavailable";
+        }
+        ClassChangeAnalyzer.ClassShape before = analysis.getBefore();
+        ClassChangeAnalyzer.ClassShape after = analysis.getAfter();
+        if (!after.getFields().containsAll(before.getFields())) {
+            return "generation_cannot_remove_or_retype_fields";
+        }
+        if (!after.getMethods().containsAll(before.getMethods())) {
+            return "generation_cannot_remove_or_change_methods";
+        }
+        if (!after.getClassAnnotations().containsAll(before.getClassAnnotations())) {
+            return "generation_cannot_remove_inherited_class_annotations";
+        }
+        return null;
     }
 
     public static Map<String, Class<?>> currentTypes(Iterable<String> binaryNames) {

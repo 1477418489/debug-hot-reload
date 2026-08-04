@@ -59,6 +59,8 @@ public final class StructureSubclassFactory {
         }
         final String originalBinary = original.getName();
         final String originalInternal = originalBinary.replace('.', '/');
+        ClassReader reader = new ClassReader(reloadedBytecode);
+        validateRepresentableHierarchy(original, originalInternal, reader);
         int gen = SEQ.incrementAndGet();
         final String tag = "hr-gen-" + gen;
         final String genBinary = originalBinary + "__HrGen" + gen;
@@ -70,7 +72,6 @@ public final class StructureSubclassFactory {
         // so new code reads/writes the new type instead of CCE-ing through the parent bridge.
         final Map<String, String> redeclaredFields = new HashMap<String, String>();
 
-        ClassReader reader = new ClassReader(reloadedBytecode);
         ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         reader.accept(new ClassVisitor(Opcodes.ASM9, writer) {
             private String sourceSuper = "java/lang/Object";
@@ -349,6 +350,34 @@ public final class StructureSubclassFactory {
         }, ClassReader.EXPAND_FRAMES);
         return new Built(genBinary, genInternal, writer.toByteArray(), tag,
                 bridgedFields.get(), bridgedMethods.get());
+    }
+
+    private static void validateRepresentableHierarchy(Class<?> original, String originalInternal,
+                                                        ClassReader reader) {
+        if (original.isInterface()) {
+            throw new IllegalStateException("interface_generation_unsupported:" + original.getName());
+        }
+        if (!originalInternal.equals(reader.getClassName())) {
+            throw new IllegalStateException("generation_name_mismatch:" + reader.getClassName());
+        }
+        int access = reader.getAccess();
+        if ((access & (Opcodes.ACC_FINAL | Opcodes.ACC_INTERFACE | Opcodes.ACC_ANNOTATION
+                | Opcodes.ACC_ENUM | Opcodes.ACC_RECORD)) != 0) {
+            throw new IllegalStateException("generation_class_kind_unsupported:" + original.getName());
+        }
+        Class<?> oldSuper = original.getSuperclass();
+        String expectedSuper = oldSuper == null ? null : Type.getInternalName(oldSuper);
+        if (!Objects.equals(expectedSuper, reader.getSuperName())) {
+            throw new IllegalStateException("superclass_change_requires_restart:" + original.getName());
+        }
+        Set<String> nextInterfaces = new HashSet<String>();
+        for (String nextInterface : reader.getInterfaces()) nextInterfaces.add(nextInterface);
+        for (Class<?> oldInterface : original.getInterfaces()) {
+            if (!nextInterfaces.contains(Type.getInternalName(oldInterface))) {
+                throw new IllegalStateException("removed_interface_requires_restart:"
+                        + oldInterface.getName());
+            }
+        }
     }
 
     private static final class MemberIndex {

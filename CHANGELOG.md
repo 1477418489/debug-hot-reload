@@ -2,6 +2,18 @@
 
 版本号唯一来源为根项目 `build.gradle.kts`。插件内发布说明见 `hotreload-idea/src/main/resources/META-INF/plugin.xml`。
 
+## 1.0.1 - 2026-08-04
+
+首个正式基线的可靠性补丁，收紧 Class、Mapper XML、配置文件和静态资源热更新的成功判定与失败边界。
+
+- Class 批次在 JVM 原子重定义失败后逐类隔离重试，避免普通方法体变更被其他结构变更连带判为需重启。
+- E3 generation 仅在变更可由可赋值子类表达且对应直接 Spring Bean 确实重建成功后报告成功；删除/改签名成员、层级变化、非 Spring 类及加载目标歧义会明确要求重启。
+- 新类只在真实应用类加载器中定义；注解索引写入、Spring 重绑及 MVC 路由恢复失败不再产生假成功，条件化组件交由重启后的 Spring 冷启动流程判定。
+- Mapper XML 多会话调度改为原子接纳并补全队列拒绝、文件生命周期、内容类型切换和有界目录扫描处理。
+- 配置文件在多个 Spring Context 间事务更新，失败时回滚；回滚失败会保留明确的需重启结论和诊断。
+- 静态资源按有效 Debug 会话和 source root 隔离，同步后严格检查 Spring MVC 缓存清理结果；大目录截断及缓存清理失败要求重启。
+- 明确静态资源流程不调用 LiveReload、模板引擎、浏览器或其他 UI 控件。
+
 ## 1.0.0 - 2026-08-04
 
 首个正式基线版本，面向 IntelliJ IDEA Debug 场景提供完整、可配置且可诊断的 Java / Spring / MyBatis 热更新能力。

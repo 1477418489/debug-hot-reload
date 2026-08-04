@@ -506,7 +506,12 @@ public final class SpringFrameworkRebinder {
                 }
                 if (nameSet.isEmpty()) {
                     // register a lightweight singleton definition for brand-new @Component-like classes
-                    if (looksLikeComponent(changed) && registerDynamicBean(factory, changed, details)) {
+                    // A generation represents an existing type. If its original Bean is absent
+                    // (for example due to @Profile/@Conditional), creating one here violates the
+                    // application's registration conditions and can introduce unintended routes.
+                    if (!isGenerationClassName(changed.getName())
+                            && looksLikeComponent(changed)
+                            && registerDynamicBean(factory, changed, details)) {
                         String dyn = guessBeanName(changed);
                         if (dyn != null) nameSet.add(dyn);
                     } else {
@@ -529,9 +534,18 @@ public final class SpringFrameworkRebinder {
                         if (bean != null) {
                             recreated++;
                             boolean proxy = isProxyClass(bean.getClass());
+                            if (isGenerationClassName(changed.getName())) {
+                                Object target = proxy ? unwrapAopTarget(bean) : bean;
+                                String businessName = originalBusinessType(changed).getName();
+                                if (target != null && changed.isInstance(target)) {
+                                    details.add("generationBound=" + businessName + ":" + name);
+                                } else {
+                                    details.add("generationBindFailed=" + businessName + ":" + name);
+                                }
+                            }
                             details.add("recreated=" + name + ":" + bean.getClass().getSimpleName()
                                     + ":proxy=" + proxy
-                                    + (HotReloadClassRegistry.generation(originalBusinessType(changed).getName()) > 0
+                                    + (isGenerationClassName(changed.getName())
                                     ? ":gen=" + HotReloadClassRegistry.generation(originalBusinessType(changed).getName()) : ""));
                         }
                     } catch (Throwable failure) {
@@ -578,11 +592,25 @@ public final class SpringFrameworkRebinder {
                     nameSet.add(guessed);
                 }
                 if (nameSet.isEmpty()) {
-                    if (looksLikeComponent(changed) && registerDynamicBean(factory, changed, details)) {
-                        String dyn = guessBeanName(changed);
-                        if (dyn != null && getBeanQuietly(context, dyn) != null) {
-                            touched++;
-                            details.add("registeredNewBean=" + dyn);
+                    if (!deepChange) {
+                        details.add("refreshSkipped=" + changed.getSimpleName() + ":bodyOnlyNoBean");
+                        continue;
+                    }
+                    if (!isGenerationClassName(changed.getName())
+                            && looksLikeComponent(changed)) {
+                        if (hasConditionalRegistrationMetadata(changed)) {
+                            details.add("conditionalBeanRegistrationRequiresRestart="
+                                    + changed.getName());
+                        } else if (registerDynamicBean(factory, changed, details)) {
+                            String dyn = guessBeanName(changed);
+                            if (dyn != null && getBeanQuietly(context, dyn) != null) {
+                                touched++;
+                                details.add("registeredNewBean=" + dyn);
+                            } else {
+                                details.add("dynamicBeanBindFailed=" + changed.getName());
+                            }
+                        } else {
+                            details.add("dynamicBeanRegistrationFailed=" + changed.getName());
                         }
                     }
                     continue;
@@ -1049,12 +1077,11 @@ public final class SpringFrameworkRebinder {
      * its base class or an older generation. Base class counts as generation 0.
      */
     static boolean shouldReplaceBeanClass(String currentName, String candidateName) {
-        if (candidateName == null) return false;
-        if (currentName == null) return true;
+        if (candidateName == null || currentName == null) return false;
         if (currentName.equals(candidateName)) return false;
         String currentBase = HotReloadClassRegistry.stripGenerationName(currentName);
         String candidateBase = HotReloadClassRegistry.stripGenerationName(candidateName);
-        if (!currentBase.equals(candidateBase)) return true;
+        if (!currentBase.equals(candidateBase)) return false;
         return generationOrdinal(candidateName) > generationOrdinal(currentName);
     }
 
@@ -1142,6 +1169,7 @@ public final class SpringFrameworkRebinder {
 
     private static boolean looksLikeComponent(Class<?> type) {
         if (type == null) return false;
+        if (hasAnnotationNamed(type, "org.springframework.stereotype.Component")) return true;
         try {
             Annotation[] anns = type.getAnnotations();
             for (Annotation ann : anns) {
@@ -1158,6 +1186,53 @@ public final class SpringFrameworkRebinder {
                     || desc.contains("Repository") || desc.contains("Controller")
                     || desc.contains("Configuration"))) return true;
         } catch (Throwable ignored) { }
+        return false;
+    }
+
+    private static boolean hasConditionalRegistrationMetadata(Class<?> type) {
+        if (hasAnnotationNamed(type,
+                "org.springframework.context.annotation.Profile",
+                "org.springframework.context.annotation.Conditional")) {
+            return true;
+        }
+        try {
+            String desc = RuntimeAnnotationIndex.describe(type);
+            return desc != null && (desc.contains("Profile") || desc.contains("Conditional"));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    static boolean hasAnnotationNamed(Class<?> type, String... targetNames) {
+        if (type == null || targetNames == null || targetNames.length == 0) return false;
+        Set<String> targets = new LinkedHashSet<String>();
+        for (String targetName : targetNames) {
+            if (targetName != null && !targetName.isEmpty()) targets.add(targetName);
+        }
+        return !targets.isEmpty() && hasAnnotationNamed(
+                type.getDeclaredAnnotations(), targets, new LinkedHashSet<Class<?>>());
+    }
+
+    private static boolean hasAnnotationNamed(Annotation[] annotations, Set<String> targets,
+                                              Set<Class<?>> visited) {
+        if (annotations == null) return false;
+        for (Annotation annotation : annotations) {
+            if (annotation == null) continue;
+            Class<?> annotationType = annotation.annotationType();
+            if (annotationType == null) continue;
+            if (targets.contains(annotationType.getName())) return true;
+            if (!visited.add(annotationType)
+                    || annotationType.getName().startsWith("java.lang.annotation.")) {
+                continue;
+            }
+            try {
+                if (hasAnnotationNamed(annotationType.getDeclaredAnnotations(), targets, visited)) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+                // An inaccessible optional annotation must not break Spring rebind discovery.
+            }
+        }
         return false;
     }
 
@@ -2061,12 +2136,56 @@ public final class SpringFrameworkRebinder {
         public int getBeansRecreated() { return beansRecreated; }
         public int getFailures() { return failures; }
 
-        /** Self-check verdict: mapping routes were unregistered but never restored. */
+        /** Self-check verdict: required mapping routes were not completely restored. */
         public boolean hasRoutesLost() {
             for (String detail : details) {
-                if (detail != null && detail.startsWith("selfCheck=FAILED")) return true;
+                if (detail == null) continue;
+                if (detail.startsWith("selfCheck=FAILED")
+                        || detail.startsWith("selfCheck=WARN:partialRoutes")
+                        || detail.startsWith("mappingFallbackResult=initHandlerMethodsMissing")) {
+                    return true;
+                }
+                if (detail.startsWith("mappingFallbackResult=")
+                        && detail.contains("recovered=false")) {
+                    return true;
+                }
             }
             return false;
+        }
+
+        /** True when a required Spring state transition did not complete. */
+        public boolean hasIncompleteChanges() {
+            if (hasRoutesLost()) return true;
+            for (String detail : details) {
+                if (detail == null) continue;
+                if (detail.startsWith("contextFailed=")
+                        || detail.startsWith("recreateFailed=")
+                        || detail.startsWith("beanNamesFailed=")
+                        || detail.startsWith("refreshFailed=")
+                        || detail.startsWith("reinjectFailed=")
+                        || detail.startsWith("upgradeBeanDefFailed=")
+                        || detail.startsWith("generationBindFailed=")
+                        || detail.startsWith("conditionalBeanRegistrationRequiresRestart=")
+                        || detail.startsWith("dynamicBeanRegistrationFailed=")
+                        || detail.startsWith("dynamicBeanBindFailed=")
+                        || detail.startsWith("detectFailed=")
+                        || detail.startsWith("mappingRefreshFailed=")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        public boolean hasUnboundGenerations(Set<String> requiredBinaryNames) {
+            if (requiredBinaryNames == null || requiredBinaryNames.isEmpty()) return false;
+            Set<String> bound = new LinkedHashSet<String>();
+            for (String detail : details) {
+                if (detail == null || !detail.startsWith("generationBound=")) continue;
+                String value = detail.substring("generationBound=".length());
+                int separator = value.indexOf(':');
+                bound.add(separator < 0 ? value : value.substring(0, separator));
+            }
+            return !bound.containsAll(requiredBinaryNames);
         }
 
         public String summary() {

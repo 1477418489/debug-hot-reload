@@ -5,7 +5,7 @@
 
 > 仅用于开发调试，不替代生产部署。
 
-**当前版本：1.0.0（首个正式基线）**
+**当前版本：1.0.1（首个正式基线稳定性补丁）**
 
 ---
 
@@ -21,8 +21,8 @@
 
 ```
 E1 标准 redefine   方法体/常量修改              所有 JVM
-E2 增强 redefine   任意结构变更，类身份/状态保留   DCEVM 或 JBR 17+（主线）
-E3 generation      结构变更降级子类方案（受限）    无增强运行时时自动降级并明示
+E2 增强 redefine   运行时接受的结构变更，身份/状态保留  DCEVM 或 JBR 17+（主线）
+E3 generation      可表达的新增成员，限直接 Spring Bean  无增强运行时时自动降级并明示
 ```
 
 会话激活日志显示当前引擎：`热更引擎=增强(结构变更原生支持，Bean与状态保留)` 或 `标准(...)`。
@@ -44,6 +44,7 @@ E3 generation      结构变更降级子类方案（受限）    无增强运行
 - **JDK 17/21**：项目 JDK 使用 [JetBrains Runtime](https://github.com/JetBrains/JetBrainsRuntime)（IDEA 自带）。检测到后自动追加 `-XX:+AllowEnhancedClassRedefinition`
 
 未启用增强运行时也可使用（E1/E3 降级链），结构变更能力受限并在日志明示。
+E3 仅在可赋值子类能够表达变更且对应直接 Spring Bean 成功重建时报告成功；删除或改签名方法、删除或改类型字段、父类变化、既有接口移除以及非 Spring 类结构变更均需 E2 或重启。
 
 ## 安装
 
@@ -126,10 +127,12 @@ docs/                 运行环境与框架兼容矩阵
 
 - 枚举加值：`values()` 不含新值（静态初始化不重跑），提示需重启
 - 删除的方法若仍被未热更的调用方引用会 `NoSuchMethodError`（与编译期语义一致）
-- 新增**全新** Mapper XML 文件（新 namespace）暂需重启
+- Mapper XML 文件或目录的新增、删除、移动、重命名，以及内容在 Mapper/非 Mapper 间切换，需重启
+- 配置文件或目录的新增、删除、移动、重命名需重启；已加载配置文件的安全内容变更可热更新
 - `@Value`/`@ConfigurationProperties` 已注入值不随配置文件热更自动刷新（Environment 动态读取即时生效）
 - YAML 配置热更新只接受可扁平化为字符串键值的简单 mapping；列表、多文档、锚点/别名、流式集合、块标量和 null 会整体拒绝，避免半更新
 - 配置文件必须已经存在于当前 Spring Environment 的属性源中；无法证明其优先级时会安全跳过
+- 新增或首次激活的 Spring 组件若带 `@Profile` / `@Conditional`（含组合注解）需重启，由 Spring 冷启动流程判定是否注册
 - 插件只清理服务端静态资源缓存，不负责触发浏览器刷新
 - 删除类、类卸载不支持（JVM 限制）
 

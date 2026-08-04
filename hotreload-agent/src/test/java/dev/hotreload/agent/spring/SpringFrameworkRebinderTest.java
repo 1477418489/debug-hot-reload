@@ -8,6 +8,10 @@ import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -69,6 +73,53 @@ class SpringFrameworkRebinderTest {
     }
 
     @Test
+    void requiredSpringFailuresMarkTheRebindIncomplete() {
+        for (String detail : Arrays.asList(
+                "contextFailed=IllegalStateException",
+                "recreateFailed=demo:IllegalStateException",
+                "beanNamesFailed=DemoService",
+                "refreshFailed=DemoService:IllegalStateException",
+                "reinjectFailed=demo:IllegalStateException",
+                "upgradeBeanDefFailed=DemoService",
+                "conditionalBeanRegistrationRequiresRestart=com.example.DemoService",
+                "dynamicBeanRegistrationFailed=com.example.DemoService",
+                "dynamicBeanBindFailed=com.example.DemoService",
+                "detectFailed=IllegalStateException",
+                "mappingRefreshFailed=IllegalStateException",
+                "selfCheck=WARN:partialRoutes expected=3 restored=2",
+                "mappingFallbackResult=initHandlerMethodsMissing",
+                "mappingFallbackResult=before=4 after=2 recovered=false")) {
+            Set<String> details = new LinkedHashSet<String>(Collections.singleton(detail));
+            SpringFrameworkRebinder.RebindReport report =
+                    new SpringFrameworkRebinder.RebindReport(1, 0, 0, 0, 1, details);
+            assertTrue(report.hasIncompleteChanges(), detail);
+        }
+        SpringFrameworkRebinder.RebindReport cacheOnly = new SpringFrameworkRebinder.RebindReport(
+                1, 0, 0, 0, 1, new LinkedHashSet<String>(Collections.singleton(
+                "jacksonCacheClearFailed=IllegalStateException")));
+        assertFalse(cacheOnly.hasIncompleteChanges());
+    }
+
+    @Test
+    void generationBindingReportRequiresEveryChangedBusinessType() {
+        Set<String> required = new LinkedHashSet<String>(Arrays.asList(
+                "com.example.OrderService", "com.example.OrderController"));
+        Set<String> fullyBound = new LinkedHashSet<String>(Arrays.asList(
+                "generationBound=com.example.OrderService:orderService",
+                "generationBound=com.example.OrderController:orderController"));
+        SpringFrameworkRebinder.RebindReport complete = new SpringFrameworkRebinder.RebindReport(
+                1, 0, 0, 2, 0, fullyBound);
+        assertFalse(complete.hasUnboundGenerations(required));
+
+        Set<String> partiallyBound = new LinkedHashSet<String>(Collections.singleton(
+                "generationBound=com.example.OrderService:orderService"));
+        SpringFrameworkRebinder.RebindReport incomplete = new SpringFrameworkRebinder.RebindReport(
+                1, 0, 0, 1, 0, partiallyBound);
+        assertTrue(incomplete.hasUnboundGenerations(required));
+        assertFalse(incomplete.hasUnboundGenerations(Collections.<String>emptySet()));
+    }
+
+    @Test
     void needsMappingFallbackWhenPartialKeysRestored() {
         // User log: unregistered=9 restoredKeys=3 => afterRegister < before
         assertTrue(SpringFrameworkRebinder.needsMappingFallback(9, 9, 3, 1, true));
@@ -123,9 +174,17 @@ class SpringFrameworkRebinderTest {
         assertFalse(SpringFrameworkRebinder.shouldReplaceBeanClass(gen2, gen1));
         assertFalse(SpringFrameworkRebinder.shouldReplaceBeanClass(gen1, gen1));
         assertFalse(SpringFrameworkRebinder.shouldReplaceBeanClass(gen1, null));
-        assertTrue(SpringFrameworkRebinder.shouldReplaceBeanClass(null, gen1));
-        assertTrue(SpringFrameworkRebinder.shouldReplaceBeanClass("com.a.Foo", "com.b.Bar"));
+        assertFalse(SpringFrameworkRebinder.shouldReplaceBeanClass(null, gen1));
+        assertFalse(SpringFrameworkRebinder.shouldReplaceBeanClass("com.a.Foo", "com.b.Bar"));
         assertFalse(SpringFrameworkRebinder.shouldReplaceBeanClass(base + "$$HrGen9", base + "$$HrGen3"));
+    }
+
+    @Test
+    void annotationLookupTraversesMetaAnnotations() {
+        assertTrue(SpringFrameworkRebinder.hasAnnotationNamed(
+                MetaAnnotatedComponent.class, RootComponentMarker.class.getName()));
+        assertFalse(SpringFrameworkRebinder.hasAnnotationNamed(
+                MetaAnnotatedComponent.class, "com.example.MissingAnnotation"));
     }
 
     @Test
@@ -384,6 +443,18 @@ class SpringFrameworkRebinderTest {
         return new GenerationClassLoader(SpringFrameworkRebinderTest.class.getClassLoader(),
                 binaryName, writer.toByteArray()).defineTarget();
     }
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.ANNOTATION_TYPE)
+    @interface RootComponentMarker { }
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.TYPE)
+    @RootComponentMarker
+    @interface MetaComponentMarker { }
+
+    @MetaComponentMarker
+    static final class MetaAnnotatedComponent { }
 
     /** Reflection target mimicking RootBeanDefinition for the rebinder's method lookups. */
     static final class FakeBeanDefinition {

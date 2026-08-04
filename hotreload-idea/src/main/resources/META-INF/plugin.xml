@@ -11,7 +11,7 @@
       <li><b>增强引擎支持</b>：自动检测 DCEVM/JetBrains Runtime，结构变更保持类身份，存活实例即时生效</li>
       <li><b>Spring Bean 智能重载</b>：注解/字段变更时原地补注入，仅代理过期时重建，避免全量销毁</li>
       <li><b>方法体 & 注解热更新</b>：修改方法实现、增删 @Transactional/@RequestMapping 等注解即时生效</li>
-      <li><b>结构变更支持</b>：新增/删除方法、字段，自动降级 Generation 路径或增强引擎原生支持</li>
+      <li><b>结构变更支持</b>：增强引擎原地处理运行时接受的结构变更；Generation 仅降级处理可表达的新增成员和直接 Spring Bean</li>
       <li><b>MyBatis Mapper XML</b>：修改 SQL 后自动清理缓存，无需重启</li>
       <li><b>配置文件热更新</b>：application.properties / yml 修改后刷新到 Spring Environment</li>
       <li><b>静态资源热更新</b>：HTML/CSS/JS/图片/字体安全同步到当前 Debug 类路径并刷新 Spring MVC 资源缓存</li>
@@ -43,6 +43,16 @@
     </ul>
   ]]></description>
   <change-notes><![CDATA[
+    <b>1.0.1 — 首个正式基线稳定性补丁</b>
+    <ul>
+      <li>Class 批次失败后逐类隔离重试，并收紧 Generation、条件化 Spring Bean、注解索引和路由恢复的成功判定</li>
+      <li>删除或改签名成员、层级变化、非 Spring 类结构变更及加载目标歧义会明确要求 E2 或重启</li>
+      <li>Mapper XML 多会话原子调度，补全队列拒绝、生命周期变化、内容类型切换和目录扫描上限</li>
+      <li>配置文件跨 Spring Context 事务回滚，并明确报告回滚失败</li>
+      <li>静态资源强化会话/source root 隔离、classpath 校验及 Spring MVC 缓存清理结果判定</li>
+      <li>静态资源流程不调用 LiveReload、模板引擎、浏览器或其他 UI 控件</li>
+    </ul>
+
     <b>1.0.0 — 首个正式基线</b>
     <p>面向 IDEA Debug 场景提供完整、可配置且可诊断的 Java/Spring/MyBatis 全栈热更新能力。</p>
 

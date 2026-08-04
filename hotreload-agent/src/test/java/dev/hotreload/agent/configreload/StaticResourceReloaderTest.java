@@ -3,6 +3,7 @@ package dev.hotreload.agent.configreload;
 import dev.hotreload.agent.logging.AgentSessionLogger;
 import dev.hotreload.agent.spring.SpringContextRegistry;
 import dev.hotreload.protocol.message.OperationStatus;
+import dev.hotreload.protocol.message.ReloadErrorCode;
 import dev.hotreload.protocol.message.ReloadResponse;
 import dev.hotreload.protocol.message.ResourceReloadRequest;
 import org.junit.jupiter.api.AfterEach;
@@ -122,6 +123,41 @@ class StaticResourceReloaderTest {
         }
     }
 
+    @Test void cacheClearFailureRequiresRestart() throws Exception {
+        FakeFailingContext context = new FakeFailingContext();
+        SpringContextRegistry.register(context);
+        AgentSessionLogger logger = new AgentSessionLogger("static-resource-failed",
+                tempDirectory.resolve("failed-agent.log").toAbsolutePath());
+        try {
+            ReloadResponse response = new StaticResourceReloader(logger).reload(
+                    new ResourceReloadRequest("request", "token", "static/app.css",
+                            new byte[0], "css"));
+
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus());
+            assertEquals(ReloadErrorCode.INTERNAL_ERROR, response.getErrorCode());
+            assertEquals("cache=failed", response.getItems().get(0).getDiagnostic());
+        } finally {
+            logger.close();
+        }
+    }
+
+    @Test void cacheComponentDiscoveryFailureRequiresRestart() throws Exception {
+        FakeGetterFailingContext context = new FakeGetterFailingContext();
+        SpringContextRegistry.register(context);
+        AgentSessionLogger logger = new AgentSessionLogger("static-resource-getter-failed",
+                tempDirectory.resolve("getter-failed-agent.log").toAbsolutePath());
+        try {
+            ReloadResponse response = new StaticResourceReloader(logger).reload(
+                    new ResourceReloadRequest("request", "token", "static/app.css",
+                            new byte[0], "css"));
+
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus());
+            assertEquals(ReloadErrorCode.INTERNAL_ERROR, response.getErrorCode());
+        } finally {
+            logger.close();
+        }
+    }
+
     @Test void ignoresAnUnrelatedBeanUsingTheLegacyProviderName() throws Exception {
         FakeUnrelatedProviderContext context = new FakeUnrelatedProviderContext();
         SpringContextRegistry.register(context);
@@ -173,6 +209,29 @@ class StaticResourceReloaderTest {
         public Object getBeanFactory() { return null; }
     }
 
+    private static final class FakeFailingContext {
+        private final FakeResourceUrlProvider provider = new FakeResourceUrlProvider(
+                new FakeResourceHandler(new FakeFailingCachingComponent(),
+                        new FakeCachingComponent(new FakeSpringCache())));
+
+        public Object getBean(String name) {
+            return "mvcResourceUrlProvider".equals(name) ? provider : null;
+        }
+
+        public Object getBeanFactory() { return null; }
+    }
+
+    private static final class FakeGetterFailingContext {
+        private final FakeResourceUrlProvider provider = new FakeResourceUrlProvider(
+                new FakeGetterFailingHandler());
+
+        public Object getBean(String name) {
+            return "mvcResourceUrlProvider".equals(name) ? provider : null;
+        }
+
+        public Object getBeanFactory() { return null; }
+    }
+
     private static final class FakeCache {
         private int clearCount;
 
@@ -209,6 +268,14 @@ class StaticResourceReloaderTest {
         public List<Object> getResourceTransformers() { return transformers; }
     }
 
+    private static final class FakeGetterFailingHandler {
+        public List<Object> getResourceResolvers() {
+            throw new IllegalStateException("injected resolver lookup failure");
+        }
+
+        public List<Object> getResourceTransformers() { return Collections.emptyList(); }
+    }
+
     private static final class FakeResourceUrlProvider
             extends org.springframework.web.servlet.resource.ResourceUrlProvider {
         private final Map<String, Object> handlerMap = new LinkedHashMap<String, Object>();
@@ -227,6 +294,14 @@ class StaticResourceReloaderTest {
         private FakeCachingComponent(FakeSpringCache cache) { this.cache = cache; }
 
         public FakeSpringCache getCache() { return cache; }
+    }
+
+    private static final class FakeFailingCachingComponent {
+        public FakeFailingCache getCache() { return new FakeFailingCache(); }
+    }
+
+    private static final class FakeFailingCache {
+        public void clear() { throw new IllegalStateException("injected clear failure"); }
     }
 
     private static final class FakeSpringCache {

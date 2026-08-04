@@ -14,7 +14,6 @@ import java.lang.instrument.Instrumentation;
 import java.lang.instrument.UnmodifiableClassException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -70,18 +69,23 @@ public final class ClassBatchReloader {
         Map<String, List<Class<?>>> loadedByName = loadedClasses(updates);
         List<ReloadItemResult> items = new ArrayList<ReloadItemResult>(updates.size());
         List<ClassDefinition> redefineBatch = new ArrayList<ClassDefinition>();
+        List<RedefineCandidate> pendingRedefines = new ArrayList<RedefineCandidate>();
+        // This list contains only updates that were actually applied. Pending body updates are
+        // added after the atomic redefine call succeeds.
         List<Class<?>> redefinedTargets = new ArrayList<Class<?>>();
         Map<Class<?>, byte[]> annotationUpdates = new LinkedHashMap<Class<?>, byte[]>();
         List<Class<?>> springCandidates = new ArrayList<Class<?>>();
         Set<String> rebindHints = new LinkedHashSet<String>();
         // Structure/annotation deltas need bean-level refresh; body-only classes must keep state.
         Set<String> deepChangedNames = new LinkedHashSet<String>();
+        Set<String> generationRequiredNames = new LinkedHashSet<String>();
         // RequestMapping refresh is expensive and unsafe when partial; only when mapping metadata changes.
         boolean needsMappingRefresh = false;
         int definedCount = 0;
         int redefinedCount = 0;
         int failedCount = 0;
         boolean restartRequired = false;
+        boolean requiredPostProcessingFailed = false;
         ReloadErrorCode firstError = null;
 
         for (ClassUpdate update : updates) {
@@ -106,10 +110,11 @@ public final class ClassBatchReloader {
             }
             if (target == null) {
                 int count = matches == null ? 0 : matches.size();
-                ReloadItemResult item = item(update.getBinaryName(), OperationStatus.FAILED,
+                ReloadItemResult item = item(update.getBinaryName(), OperationStatus.RESTART_REQUIRED,
                         ReloadErrorCode.CLASS_AMBIGUOUS, "loadedCount=" + count);
                 items.add(item);
                 failedCount++;
+                restartRequired = true;
                 if (firstError == null) firstError = ReloadErrorCode.CLASS_AMBIGUOUS;
                 continue;
             }
@@ -138,13 +143,6 @@ public final class ClassBatchReloader {
                             + ",forceAnnotationPatch=" + forceAnnotationPatch));
             if (analysis.isAnnotationChanged()) rebindHints.add("annotation=" + update.getBinaryName());
             if (analysis.isStructureChanged()) rebindHints.add("structure=" + update.getBinaryName());
-            if (analysis.isAnnotationChanged() || analysis.isStructureChanged()) {
-                deepChangedNames.add(update.getBinaryName());
-            }
-            if (analysis.needsRequestMappingRefresh()) {
-                needsMappingRefresh = true;
-                rebindHints.add("mappingRefreshNeeded=" + update.getBinaryName());
-            }
             if (analysis.isStructureChanged()) {
                 StructuralClassReloader.Result structural = structuralReloader.reloadExisting(target, update.getBytecode(), true);
                 logger.log(structural.success ? Level.INFO : Level.WARNING, "CLASS_STRUCTURE_RELOAD", fields(
@@ -166,7 +164,10 @@ public final class ClassBatchReloader {
                             springCandidates.add(base);
                         }
                     }
-                    annotationUpdates.put(structural.liveClass, update.getBytecode());
+                    deepChangedNames.add(update.getBinaryName());
+                    if ("generation".equals(structural.mode)) {
+                        generationRequiredNames.add(update.getBinaryName());
+                    }
                     // Structure always needs mapping rebind (new/removed methods/fields).
                     needsMappingRefresh = true;
                     items.add(item(update.getBinaryName(), OperationStatus.SUCCESS, null,
@@ -188,26 +189,43 @@ public final class ClassBatchReloader {
                 continue;
             }
             redefineBatch.add(new ClassDefinition(target, update.getBytecode()));
-            redefinedTargets.add(target);
-            if (forceAnnotationPatch) {
-                annotationUpdates.put(target, update.getBytecode());
-            }
-            if (analysis.needsSpringRebind() || forceAnnotationPatch || analysis.isStructureChanged()) {
-                springCandidates.add(target);
-            }
+            pendingRedefines.add(new RedefineCandidate(update, target, analysis, forceAnnotationPatch));
         }
 
         if (!redefineBatch.isEmpty()) {
-            AnnotationHotReloadDiagnostics.pipelineStart(logger, request.getRequestId(), redefinedTargets);
+            List<Class<?>> batchTargets = candidateTargets(pendingRedefines);
+            Throwable redefineFailure = null;
+            ReloadErrorCode redefineFailureCode = null;
+            OperationStatus redefineFailureStatus = OperationStatus.FAILED;
+            boolean redefineApplied = false;
+            AnnotationHotReloadDiagnostics.pipelineStart(logger, request.getRequestId(), batchTargets);
             logger.log(Level.INFO, "REDEFINE_BEGIN", fields("requestId", request.getRequestId(),
                     "classCount", Integer.toString(redefineBatch.size())));
             try {
                 instrumentation.redefineClasses(redefineBatch.toArray(new ClassDefinition[redefineBatch.size()]));
+                redefineApplied = true;
                 redefinedCount += redefineBatch.size();
-                for (Class<?> redefined : redefinedTargets) {
-                    HotReloadClassRegistry.put(redefined.getName(), redefined);
+                for (RedefineCandidate candidate : pendingRedefines) {
+                    Class<?> redefined = candidate.target;
+                    redefinedTargets.add(redefined);
+                    if (candidate.forceAnnotationPatch) {
+                        annotationUpdates.put(redefined, candidate.update.getBytecode());
+                    }
+                    springCandidates.add(redefined);
+                    if (candidate.analysis.isAnnotationChanged()) {
+                        deepChangedNames.add(candidate.update.getBinaryName());
+                    }
+                    if (candidate.analysis.needsRequestMappingRefresh()) {
+                        needsMappingRefresh = true;
+                        rebindHints.add("mappingRefreshNeeded=" + candidate.update.getBinaryName());
+                    }
+                    items.add(item(candidate.update.getBinaryName(), OperationStatus.SUCCESS, null,
+                            "redefined"));
                 }
-                int reflectionInvalidated = ReflectionDataInvalidator.invalidateAll(redefinedTargets);
+                for (RedefineCandidate candidate : pendingRedefines) {
+                    HotReloadClassRegistry.put(candidate.update.getBinaryName(), candidate.target);
+                }
+                int reflectionInvalidated = ReflectionDataInvalidator.invalidateAll(batchTargets);
                 int annotationPatchedMethods = 0;
                 int annotationPatchedClasses = 0;
                 // E2 (enhanced runtime): reflection now serves the new bytecode natively.
@@ -215,27 +233,44 @@ public final class ClassBatchReloader {
                 // synthesized proxies that lose Spring @AliasFor merging — skip entirely.
                 if (!enhancedRedefineCapable) {
                     for (Map.Entry<Class<?>, byte[]> entry : annotationUpdates.entrySet()) {
-                        RuntimeAnnotationIndex.update(entry.getKey(), entry.getValue());
-                        rebindHints.add(RuntimeAnnotationIndex.describe(entry.getKey()));
-                        rebindHints.add("annotationIndex=published:" + entry.getKey().getSimpleName());
-                        AnnotationHotReloadDiagnostics.bytecodePublished(logger, request.getRequestId(),
-                                entry.getKey(), entry.getValue());
-                        RuntimeAnnotationPatcher.PatchReport patch =
-                                RuntimeAnnotationPatcher.patch(entry.getKey(), entry.getValue());
-                        annotationPatchedMethods += patch.getMethodsPatched();
-                        annotationPatchedClasses += patch.getClassPatched();
-                        rebindHints.add(patch.summary());
-                        logger.log(Level.INFO, "ANNOTATION_PATCH", fields(
-                                "requestId", request.getRequestId(),
-                                "itemId", entry.getKey().getName(),
-                                "resultCode", "SUCCESS",
-                                "detail", patch.summary()));
+                        try {
+                            RuntimeAnnotationIndex.update(entry.getKey(), entry.getValue());
+                            rebindHints.add(RuntimeAnnotationIndex.describe(entry.getKey()));
+                            rebindHints.add("annotationIndex=published:" + entry.getKey().getSimpleName());
+                            AnnotationHotReloadDiagnostics.bytecodePublished(logger, request.getRequestId(),
+                                    entry.getKey(), entry.getValue());
+                            RuntimeAnnotationPatcher.PatchReport patch =
+                                    RuntimeAnnotationPatcher.patch(entry.getKey(), entry.getValue());
+                            annotationPatchedMethods += patch.getMethodsPatched();
+                            annotationPatchedClasses += patch.getClassPatched();
+                            if (!patch.isComplete()) {
+                                requiredPostProcessingFailed = true;
+                                rebindHints.add("annotationPatchIncomplete="
+                                        + entry.getKey().getName() + ":" + patch.summary());
+                            }
+                            rebindHints.add(patch.summary());
+                            logger.log(patch.isComplete() ? Level.INFO : Level.WARNING,
+                                    "ANNOTATION_PATCH", fields(
+                                    "requestId", request.getRequestId(),
+                                    "itemId", entry.getKey().getName(),
+                                    "resultCode", patch.isComplete() ? "SUCCESS" : "FAILED",
+                                    "detail", patch.summary()));
+                        } catch (Throwable patchFailure) {
+                            requiredPostProcessingFailed = true;
+                            rebindHints.add("annotationPatchFailed=" + entry.getKey().getName()
+                                    + ":" + failureDetail(patchFailure));
+                            logger.log(Level.WARNING, "ANNOTATION_PATCH", fields(
+                                    "requestId", request.getRequestId(),
+                                    "itemId", entry.getKey().getName(),
+                                    "resultCode", "FAILED",
+                                    "detail", failureDetail(patchFailure)));
+                        }
                     }
                 } else {
                     rebindHints.add("annotationPatch=skipped:enhancedRuntime");
                 }
                 if (AnnotationHotReloadDiagnostics.verboseEnabled()) {
-                    AnnotationHotReloadDiagnostics.reflectAndSpringProbe(logger, request.getRequestId(), redefinedTargets);
+                    AnnotationHotReloadDiagnostics.reflectAndSpringProbe(logger, request.getRequestId(), batchTargets);
                 }
                 logger.log(Level.INFO, "REDEFINE_END", fields("requestId", request.getRequestId(),
                         "itemId", "batch", "resultCode", "SUCCESS",
@@ -244,90 +279,173 @@ public final class ClassBatchReloader {
                         "detail", "reflectionInvalidated=" + reflectionInvalidated
                                 + ",annotationPatchedMethods=" + annotationPatchedMethods
                                 + ",annotationPatchedClasses=" + annotationPatchedClasses));
-                for (Class<?> target : redefinedTargets) {
-                    springCandidates.add(target);
-                }
             } catch (UnmodifiableClassException e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_UNMODIFIABLE, OperationStatus.FAILED, rebindHints, null);
+                if (redefineApplied) {
+                    requiredPostProcessingFailed = true;
+                    rebindHints.add("postRedefineFailed=" + failureDetail(e));
+                } else {
+                    redefineFailure = e;
+                    redefineFailureCode = ReloadErrorCode.CLASS_UNMODIFIABLE;
+                }
             } catch (UnsupportedClassVersionError e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_VERSION_UNSUPPORTED, OperationStatus.FAILED, rebindHints, null);
+                if (redefineApplied) {
+                    requiredPostProcessingFailed = true;
+                    rebindHints.add("postRedefineFailed=" + failureDetail(e));
+                } else {
+                    redefineFailure = e;
+                    redefineFailureCode = ReloadErrorCode.CLASS_VERSION_UNSUPPORTED;
+                }
             } catch (UnsupportedOperationException e) {
-                // Last-chance structure recovery: analysis may have missed the delta, or JVM
-                // rejected a redefine that structural path can still handle via generation class.
-                List<ClassDefinition> survivors = new ArrayList<ClassDefinition>();
-                int recovered = 0;
-                for (ClassDefinition definition : redefineBatch) {
-                    Class<?> target = definition.getDefinitionClass();
-                    byte[] bytecode = definition.getDefinitionClassFile();
-                    // Always force knownStructure=true so we never call redefineClasses again.
-                    StructuralClassReloader.Result structural =
-                            structuralReloader.reloadExisting(target, bytecode, true);
-                    logger.log(structural.success ? Level.INFO : Level.WARNING, "CLASS_STRUCTURE_FALLBACK", fields(
-                            "requestId", request.getRequestId(),
-                            "itemId", target.getName(),
-                            "resultCode", structural.success ? "SUCCESS" : "FAILED",
-                            "detail", "mode=" + structural.mode + "," + structural.detail
-                                    + ",cause=" + String.valueOf(e.getMessage())));
-                    if (structural.success && structural.liveClass != null) {
-                        recovered++;
-                        redefinedCount++;
-                        redefinedTargets.add(structural.liveClass);
-                        springCandidates.add(structural.liveClass);
-                        annotationUpdates.put(structural.liveClass, bytecode);
-                        deepChangedNames.add(target.getName());
-                        items.add(item(target.getName(), OperationStatus.SUCCESS, null,
-                                "structure-fallback:" + structural.mode + ":" + structural.detail));
-                        rebindHints.add("structureFallback=" + structural.mode + ":" + target.getName());
-                        needsMappingRefresh = true;
-                    } else {
-                        survivors.add(definition);
+                if (redefineApplied) {
+                    requiredPostProcessingFailed = true;
+                    rebindHints.add("postRedefineFailed=" + failureDetail(e));
+                } else {
+                    // The JVM reports only one exception for an atomic batch. Retry each class
+                    // separately so a single hidden schema delta does not force unrelated body
+                    // changes through Generation as well.
+                    int recovered = 0;
+                    int unrecovered = 0;
+                    for (RedefineCandidate candidate : pendingRedefines) {
+                        Class<?> target = candidate.target;
+                        byte[] bytecode = candidate.update.getBytecode();
+                        StructuralClassReloader.Result structural = null;
+                        Throwable itemFailure = e;
+                        ReloadErrorCode itemFailureCode = ReloadErrorCode.CLASS_REDEFINE_FAILED;
+                        OperationStatus itemFailureStatus = OperationStatus.FAILED;
+                        try {
+                            instrumentation.redefineClasses(new ClassDefinition(target, bytecode));
+                            ReflectionDataInvalidator.invalidateAll(
+                                    Collections.<Class<?>>singletonList(target));
+                            if (!enhancedRedefineCapable) {
+                                try {
+                                    RuntimeAnnotationIndex.update(target, bytecode);
+                                    RuntimeAnnotationPatcher.PatchReport patch =
+                                            RuntimeAnnotationPatcher.patch(target, bytecode);
+                                    rebindHints.add(patch.summary());
+                                    if (!patch.isComplete()) {
+                                        requiredPostProcessingFailed = true;
+                                        rebindHints.add("annotationPatchIncomplete="
+                                                + target.getName() + ":" + patch.summary());
+                                    }
+                                } catch (Throwable patchFailure) {
+                                    requiredPostProcessingFailed = true;
+                                    rebindHints.add("annotationPatchFailed=" + target.getName()
+                                            + ":" + failureDetail(patchFailure));
+                                }
+                            }
+                            HotReloadClassRegistry.put(candidate.update.getBinaryName(), target);
+                            structural = new StructuralClassReloader.Result(target, "redefined",
+                                    "isolated_redefine_after_batch_rejection", true);
+                        } catch (UnsupportedOperationException individualFailure) {
+                            itemFailure = individualFailure;
+                            structural = structuralReloader.reloadExisting(target, bytecode, true);
+                            if (isStructureChange(individualFailure) || isStructureChange(e)) {
+                                itemFailureCode = ReloadErrorCode.CLASS_STRUCTURE_CHANGED;
+                                itemFailureStatus = OperationStatus.RESTART_REQUIRED;
+                            }
+                        } catch (UnmodifiableClassException individualFailure) {
+                            itemFailure = individualFailure;
+                            itemFailureCode = ReloadErrorCode.CLASS_UNMODIFIABLE;
+                        } catch (UnsupportedClassVersionError individualFailure) {
+                            itemFailure = individualFailure;
+                            itemFailureCode = ReloadErrorCode.CLASS_VERSION_UNSUPPORTED;
+                        } catch (Throwable individualFailure) {
+                            itemFailure = individualFailure;
+                        }
+                        logger.log(structural != null && structural.success ? Level.INFO : Level.WARNING,
+                                "CLASS_STRUCTURE_FALLBACK", fields(
+                                "requestId", request.getRequestId(),
+                                "itemId", candidate.update.getBinaryName(),
+                                "resultCode", structural != null && structural.success ? "SUCCESS" : "FAILED",
+                                "detail", "mode=" + (structural == null ? "failed" : structural.mode)
+                                        + "," + (structural == null ? failureDetail(itemFailure) : structural.detail)
+                                        + ",cause=" + failureDetail(itemFailure)));
+                        if (structural != null && structural.success && structural.liveClass != null) {
+                            recovered++;
+                            redefinedCount++;
+                            redefinedTargets.add(structural.liveClass);
+                            springCandidates.add(structural.liveClass);
+                            if (structural.liveClass != target) {
+                                Class<?> base = structural.liveClass.getSuperclass();
+                                if (base != null && base != Object.class) springCandidates.add(base);
+                            }
+                            if ("generation".equals(structural.mode)) {
+                                deepChangedNames.add(candidate.update.getBinaryName());
+                                generationRequiredNames.add(candidate.update.getBinaryName());
+                                needsMappingRefresh = true;
+                            } else {
+                                if (candidate.analysis.isAnnotationChanged()) {
+                                    deepChangedNames.add(candidate.update.getBinaryName());
+                                }
+                                if (candidate.analysis.needsRequestMappingRefresh()) {
+                                    needsMappingRefresh = true;
+                                }
+                            }
+                            items.add(item(candidate.update.getBinaryName(), OperationStatus.SUCCESS, null,
+                                    "structure-fallback:" + structural.mode + ":" + structural.detail));
+                            rebindHints.add("structureFallback=" + structural.mode + ":"
+                                    + candidate.update.getBinaryName());
+                        } else {
+                            unrecovered++;
+                            failedCount++;
+                            if (itemFailureStatus == OperationStatus.RESTART_REQUIRED) restartRequired = true;
+                            if (firstError == null) firstError = itemFailureCode;
+                            String structuralDetail = structural == null
+                                    ? failureDetail(itemFailure) : structural.detail;
+                            items.add(item(candidate.update.getBinaryName(), itemFailureStatus, itemFailureCode,
+                                    "structure_fallback_failed:" + structuralDetail
+                                            + ",cause=" + failureDetail(itemFailure)));
+                        }
                     }
+                    rebindHints.add("structureFallbackRecovered=" + recovered + ",remaining=" + unrecovered);
+                    // Earlier structural/new successes still require Spring rebind below.
                 }
-                if (!survivors.isEmpty()) {
-                    ReloadErrorCode code = isStructureChange(e) || StructuralClassReloader.isLikelyStructureFailure(e)
-                            ? ReloadErrorCode.CLASS_STRUCTURE_CHANGED : ReloadErrorCode.CLASS_REDEFINE_FAILED;
-                    OperationStatus status = code == ReloadErrorCode.CLASS_STRUCTURE_CHANGED
-                            ? OperationStatus.RESTART_REQUIRED : OperationStatus.FAILED;
-                    rebindHints.add("structureFallbackRecovered=" + recovered
-                            + ",remaining=" + survivors.size());
-                    return finalizeBatch(request, started, items, definedCount, recovered, updates.size(), true,
-                            code, status, rebindHints, e.getMessage());
-                }
-                rebindHints.add("structureFallbackRecovered=" + recovered);
-                // All classes recovered via generation path; continue to spring rebind below.
-            } catch (ClassFormatError e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_REDEFINE_FAILED, OperationStatus.FAILED, rebindHints, e.getMessage());
-            } catch (NoClassDefFoundError e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_REDEFINE_FAILED, OperationStatus.FAILED, rebindHints, e.getMessage());
-            } catch (ClassCircularityError e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_REDEFINE_FAILED, OperationStatus.FAILED, rebindHints, e.getMessage());
             } catch (LinkageError e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_REDEFINE_FAILED, OperationStatus.FAILED, rebindHints, e.getMessage());
+                if (redefineApplied) {
+                    requiredPostProcessingFailed = true;
+                    rebindHints.add("postRedefineFailed=" + failureDetail(e));
+                } else {
+                    redefineFailure = e;
+                    redefineFailureCode = ReloadErrorCode.CLASS_REDEFINE_FAILED;
+                }
             } catch (Exception e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_REDEFINE_FAILED, OperationStatus.FAILED, rebindHints,
-                        e.getClass().getSimpleName());
+                if (redefineApplied) {
+                    requiredPostProcessingFailed = true;
+                    rebindHints.add("postRedefineFailed=" + failureDetail(e));
+                } else {
+                    redefineFailure = e;
+                    redefineFailureCode = ReloadErrorCode.CLASS_REDEFINE_FAILED;
+                }
             } catch (InternalError e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_REDEFINE_FAILED, OperationStatus.FAILED, rebindHints,
-                        e.getClass().getSimpleName());
+                if (redefineApplied) {
+                    requiredPostProcessingFailed = true;
+                    rebindHints.add("postRedefineFailed=" + failureDetail(e));
+                } else {
+                    redefineFailure = e;
+                    redefineFailureCode = ReloadErrorCode.CLASS_REDEFINE_FAILED;
+                }
             } catch (Error e) {
-                return finalizeBatch(request, started, items, definedCount, 0, updates.size(), true,
-                        ReloadErrorCode.CLASS_REDEFINE_FAILED, OperationStatus.FAILED, rebindHints,
-                        e.getClass().getSimpleName());
+                if (redefineApplied) {
+                    requiredPostProcessingFailed = true;
+                    rebindHints.add("postRedefineFailed=" + failureDetail(e));
+                } else {
+                    redefineFailure = e;
+                    redefineFailureCode = ReloadErrorCode.CLASS_REDEFINE_FAILED;
+                }
+            }
+            if (redefineFailure != null) {
+                int rejected = appendRedefineFailures(items, pendingRedefines,
+                        redefineFailureCode, redefineFailureStatus, failureDetail(redefineFailure));
+                failedCount += rejected;
+                if (firstError == null) firstError = redefineFailureCode;
+                rebindHints.add("redefineRejected=" + rejected + ":" + failureDetail(redefineFailure));
             }
         }
 
         SpringFrameworkRebinder.RebindReport rebindReport = null;
         // Always rebind after redefine/define: even pure method-body changes can leave
         // stale RequestMappingHandlerMethod/AOP proxies when Spring caches bean type metadata.
-        if (!springCandidates.isEmpty() || redefinedCount > 0 || definedCount > 0 || !rebindHints.isEmpty()) {
+        if (!springCandidates.isEmpty() || redefinedCount > 0 || definedCount > 0) {
             Set<Class<?>> unique = new LinkedHashSet<Class<?>>(springCandidates);
             for (Class<?> target : redefinedTargets) unique.add(target);
             logger.log(Level.INFO, "ANNOTATION_REBIND_BEGIN", fields(
@@ -335,36 +453,71 @@ public final class ClassBatchReloader {
                     "classCount", Integer.toString(unique.size()),
                     "detail", "candidates=" + unique.size()));
             rebindHints.add("mappingRefresh=" + (needsMappingRefresh ? "required" : "skipNonMapping"));
-            rebindReport = springRebinder.rebind(unique, needsMappingRefresh, deepChangedNames);
-            // E3 only: rebind clears Class reflection caches; re-apply annotation truth from index.
-            // Under E2 real reflection IS the truth — re-applying would corrupt it.
-            int repatched = enhancedRedefineCapable ? 0 : RuntimeAnnotationPatcher.reapplyFromIndex(unique);
-            rebindHints.add(rebindReport.summary());
-            String probe = AnnotationHotReloadDiagnostics.compactProbeForReport(unique);
-            rebindHints.add(probe);
-            if (AnnotationHotReloadDiagnostics.verboseEnabled()) { AnnotationHotReloadDiagnostics.reflectAndSpringProbe(logger, request.getRequestId(), unique); }
-            AnnotationHotReloadDiagnostics.pipelineEnd(logger, request.getRequestId(), rebindReport.summary() + "|repatched=" + repatched + "|" + probe, unique);
-            logger.log(Level.INFO, "ANNOTATION_POST_REBIND_PROBE", fields(
-                    "requestId", request.getRequestId(),
-                    "resultCode", "OK",
-                    "detail", "repatched=" + repatched + "|" + probe));
+            try {
+                rebindReport = springRebinder.rebind(unique, needsMappingRefresh, deepChangedNames);
+                // E3 only: rebind clears Class reflection caches; re-apply annotation truth from index.
+                // Under E2 real reflection IS the truth — re-applying would corrupt it.
+                int repatched = 0;
+                if (!enhancedRedefineCapable) {
+                    try {
+                        int repatchFailures = 0;
+                        for (Class<?> type : unique) {
+                            if (type == null || RuntimeAnnotationIndex.get(type) == null) continue;
+                            if (RuntimeAnnotationPatcher.reapplyFromIndex(type)) repatched++;
+                            else repatchFailures++;
+                        }
+                        if (repatchFailures > 0) {
+                            requiredPostProcessingFailed = true;
+                            rebindHints.add("annotationRepatchIncomplete=" + repatchFailures);
+                        }
+                    } catch (Throwable repatchFailure) {
+                        requiredPostProcessingFailed = true;
+                        rebindHints.add("annotationRepatchFailed=" + failureDetail(repatchFailure));
+                    }
+                }
+                rebindHints.add(rebindReport.summary());
+                String probe = AnnotationHotReloadDiagnostics.compactProbeForReport(unique);
+                rebindHints.add(probe);
+                if (AnnotationHotReloadDiagnostics.verboseEnabled()) { AnnotationHotReloadDiagnostics.reflectAndSpringProbe(logger, request.getRequestId(), unique); }
+                AnnotationHotReloadDiagnostics.pipelineEnd(logger, request.getRequestId(), rebindReport.summary() + "|repatched=" + repatched + "|" + probe, unique);
+                logger.log(Level.INFO, "ANNOTATION_POST_REBIND_PROBE", fields(
+                        "requestId", request.getRequestId(),
+                        "resultCode", "OK",
+                        "detail", "repatched=" + repatched + "|" + probe));
+            } catch (Throwable rebindFailure) {
+                requiredPostProcessingFailed = true;
+                rebindHints.add("springRebindFailed=" + failureDetail(rebindFailure));
+                logger.log(Level.WARNING, "ANNOTATION_REBIND_END", fields(
+                        "requestId", request.getRequestId(), "resultCode", "FAILED",
+                        "detail", failureDetail(rebindFailure)));
+            }
         }
 
-        // Self-check verdict overrides success: never report OK when routes were lost.
-        if (failedCount == 0 && rebindReport != null && rebindReport.hasRoutesLost()) {
-            // Keep the full spring summary: diagnosing register failures needs
-            // notHandler/noHandlerBean/detectFailed details, not just the verdict.
-            String summary = rebindReport.summary();
-            String detail = "selfCheck=routesLost;spring=" + summary;
+        // Required Spring changes are part of the Class reload contract. A partial rebind must
+        // never leave successfully-applied bytecode reported as fully successful.
+        boolean generationBindingIncomplete = !generationRequiredNames.isEmpty()
+                && (rebindReport == null
+                || rebindReport.hasUnboundGenerations(generationRequiredNames));
+        if (generationBindingIncomplete) {
+            rebindHints.add("generationBindingIncomplete=" + join(generationRequiredNames));
+        }
+        if (requiredPostProcessingFailed || generationBindingIncomplete
+                || rebindReport != null && rebindReport.hasIncompleteChanges()) {
+            String summary = rebindReport == null ? "unavailable" : rebindReport.summary();
+            String detail = "springRebind=incomplete;spring=" + summary;
             logger.log(Level.WARNING, "CLASS_BATCH_RESULT", fields("requestId", request.getRequestId(),
                     "resultCode", "RESTART_REQUIRED", "durationMs", Long.toString(elapsedMillis(started)),
                     "detail", detail));
-            String diagnostic = "selfCheck=routesLost;" + (summary.length() > 640
+            String diagnostic = "springRebind=incomplete;" + (summary.length() > 640
                     ? summary.substring(0, 640) + "..." : summary);
             List<ReloadItemResult> checked = new ArrayList<ReloadItemResult>();
-            for (ClassUpdate update : updates) {
-                checked.add(item(update.getBinaryName(), OperationStatus.RESTART_REQUIRED,
-                        ReloadErrorCode.SPRING_REBIND_INCOMPLETE, diagnostic));
+            for (ReloadItemResult existing : orderedItems(updates, items)) {
+                if (existing.getStatus() == OperationStatus.SUCCESS) {
+                    checked.add(item(existing.getItemId(), OperationStatus.RESTART_REQUIRED,
+                            ReloadErrorCode.SPRING_REBIND_INCOMPLETE, diagnostic));
+                } else {
+                    checked.add(existing);
+                }
             }
             return new ReloadResponse(request.getRequestId(), OperationStatus.RESTART_REQUIRED,
                     ReloadErrorCode.SPRING_REBIND_INCOMPLETE, detail, checked);
@@ -386,27 +539,12 @@ public final class ClassBatchReloader {
             String technical = "defined=" + definedCount + ",redefined=" + redefinedCount + ","
                     + springDetail + ";" + probeDetail;
             String detail = chineseClassSummary(definedCount, redefinedCount, springDetail) + " | " + technical;
-            // Fill success items after rebind so diagnostics include spring summary.
-            if (items.isEmpty() || items.size() < updates.size()) {
-                items = new ArrayList<ReloadItemResult>();
-                for (ClassUpdate update : updates) {
-                    String kind = "redefined";
-                    for (String hint : rebindHints) {
-                        if (hint.startsWith("defined=") && hint.endsWith(update.getBinaryName())) {
-                            kind = "defined";
-                            break;
-                        }
-                    }
-                    items.add(item(update.getBinaryName(), OperationStatus.SUCCESS, null, kind + ";" + springDetail));
-                }
-            } else {
-                List<ReloadItemResult> enriched = new ArrayList<ReloadItemResult>(items.size());
-                for (ReloadItemResult existing : items) {
-                    enriched.add(item(existing.getItemId(), existing.getStatus(), existing.getErrorCode(),
-                            existing.getDiagnostic() + ";" + springDetail));
-                }
-                items = enriched;
+            List<ReloadItemResult> enriched = new ArrayList<ReloadItemResult>(items.size());
+            for (ReloadItemResult existing : orderedItems(updates, items)) {
+                enriched.add(item(existing.getItemId(), existing.getStatus(), existing.getErrorCode(),
+                        existing.getDiagnostic() + ";" + springDetail));
             }
+            items = enriched;
             logger.log(Level.INFO, "CLASS_BATCH_RESULT", fields("requestId", request.getRequestId(),
                     "resultCode", "SUCCESS", "durationMs", Long.toString(elapsedMillis(started)),
                     "detail", detail));
@@ -432,38 +570,36 @@ public final class ClassBatchReloader {
             return new ItemOutcome(item(update.getBinaryName(), OperationStatus.SUCCESS, null,
                     "defined:" + structural.mode), structural.liveClass);
         }
-        try {
-            Class<?> defined = NewClassDefiner.define(update.getBinaryName(), update.getBytecode(), instrumentation);
-            HotReloadClassRegistry.put(update.getBinaryName(), defined);
-            logger.log(Level.INFO, "CLASS_DEFINE_END", fields("requestId", request.getRequestId(),
-                    "itemId", update.getBinaryName(), "resultCode", "SUCCESS",
-                    "detail", "loader=" + (defined.getClassLoader() == null ? "bootstrap"
-                            : defined.getClassLoader().getClass().getName())));
-            return new ItemOutcome(item(update.getBinaryName(), OperationStatus.SUCCESS, null, "defined"), defined);
-        } catch (Throwable failure) {
-            Throwable root = failure;
-            while (root.getCause() != null && root.getCause() != root) root = root.getCause();
-            // Class may already exist in a loader but not appear in getAllLoadedClasses snapshot timing.
-            Class<?> existing = findLoaded(update.getBinaryName());
-            if (existing != null && instrumentation.isModifiableClass(existing)) {
-                try {
-                    instrumentation.redefineClasses(new ClassDefinition(existing, update.getBytecode()));
-                    logger.log(Level.INFO, "CLASS_DEFINE_END", fields("requestId", request.getRequestId(),
-                            "itemId", update.getBinaryName(), "resultCode", "SUCCESS",
-                            "detail", "fallback=redefine_existing"));
-                    return new ItemOutcome(item(update.getBinaryName(), OperationStatus.SUCCESS, null,
-                            "redefined-existing"), existing);
-                } catch (Throwable redefineFailure) {
-                    root = redefineFailure;
-                }
-            }
+        // The class may already have been defined before required annotation initialization
+        // failed. Retrying it as a plain redefine would hide that partial state as success.
+        if (structural.liveClass != null) {
             logger.log(Level.WARNING, "CLASS_DEFINE_END", fields("requestId", request.getRequestId(),
-                    "itemId", update.getBinaryName(), "resultCode", "CLASS_REDEFINE_FAILED",
-                    "detail", root.getClass().getSimpleName()));
-            return new ItemOutcome(item(update.getBinaryName(), OperationStatus.FAILED,
-                    ReloadErrorCode.CLASS_REDEFINE_FAILED,
-                    "defineFailed=" + root.getClass().getSimpleName()), null);
+                    "itemId", update.getBinaryName(), "resultCode", "RESTART_REQUIRED",
+                    "detail", structural.detail));
+            return new ItemOutcome(item(update.getBinaryName(), OperationStatus.RESTART_REQUIRED,
+                    ReloadErrorCode.CLASS_REDEFINE_FAILED, structural.detail), structural.liveClass);
         }
+        // Class may already exist in a loader but not appear in the instrumentation snapshot yet.
+        Class<?> existing = findLoaded(update.getBinaryName());
+        if (existing != null && instrumentation.isModifiableClass(existing)) {
+            try {
+                instrumentation.redefineClasses(new ClassDefinition(existing, update.getBytecode()));
+                HotReloadClassRegistry.put(update.getBinaryName(), existing);
+                logger.log(Level.INFO, "CLASS_DEFINE_END", fields("requestId", request.getRequestId(),
+                        "itemId", update.getBinaryName(), "resultCode", "SUCCESS",
+                        "detail", "fallback=redefine_existing"));
+                return new ItemOutcome(item(update.getBinaryName(), OperationStatus.SUCCESS, null,
+                        "redefined-existing"), existing);
+            } catch (Throwable redefineFailure) {
+                structural = new StructuralClassReloader.Result(null, "failed",
+                        structural.detail + "|existing_redefine_failed=" + failureDetail(redefineFailure), false);
+            }
+        }
+        logger.log(Level.WARNING, "CLASS_DEFINE_END", fields("requestId", request.getRequestId(),
+                "itemId", update.getBinaryName(), "resultCode", "RESTART_REQUIRED",
+                "detail", structural.detail));
+        return new ItemOutcome(item(update.getBinaryName(), OperationStatus.RESTART_REQUIRED,
+                ReloadErrorCode.CLASS_REDEFINE_FAILED, structural.detail), null);
     }
 
     private Class<?> findLoaded(String binaryName) {
@@ -489,6 +625,7 @@ public final class ClassBatchReloader {
                 }
             }
         }
+        items = orderedItems(request.getUpdates(), items);
         String detail = "defined=" + definedCount + ",redefined=" + redefinedCount
                 + ",failed=" + failedOrTotal
                 + (errorDetail == null ? "" : ",error=" + errorDetail)
@@ -534,35 +671,71 @@ public final class ClassBatchReloader {
         if (matches.size() == 1) {
             return matches.get(0);
         }
-        for (Class<?> candidate : matches) {
-            if (candidate != null && candidate.getClassLoader() instanceof GenerationClassLoader) {
-                if (hints != null) {
-                    hints.add("targetResolved=generationLoader");
-                }
-                return candidate;
-            }
-        }
+        Class<?> generationCandidate = null;
         for (Class<?> candidate : matches) {
             if (candidate == null) {
                 continue;
             }
             ClassLoader loader = candidate.getClassLoader();
-            if (loader != null) {
+            boolean generationLoader = loader instanceof GenerationClassLoader;
+            if (!generationLoader && loader != null) {
                 String tag = String.valueOf(loader);
-                if (tag.contains("hr-gen-") || tag.contains("GenerationClassLoader")) {
-                    if (hints != null) {
-                        hints.add("targetResolved=generationTag");
-                    }
-                    return candidate;
-                }
+                generationLoader = tag.contains("hr-gen-") || tag.contains("GenerationClassLoader");
+            }
+            if (generationLoader) {
+                if (generationCandidate != null && generationCandidate != candidate) return null;
+                generationCandidate = candidate;
             }
         }
+        if (generationCandidate != null && hints != null) {
+            hints.add("targetResolved=generationLoader");
+        }
+        if (generationCandidate != null) return generationCandidate;
         return null;
     }
     private Map<String, List<Class<?>>> loadedClasses(List<ClassUpdate> updates) {
         List<String> names = new ArrayList<String>(updates.size());
         for (ClassUpdate update : updates) names.add(update.getBinaryName());
         return LoadedClassLookup.indexRequested(instrumentation, names);
+    }
+
+    private static List<Class<?>> candidateTargets(List<RedefineCandidate> candidates) {
+        List<Class<?>> targets = new ArrayList<Class<?>>(candidates.size());
+        for (RedefineCandidate candidate : candidates) targets.add(candidate.target);
+        return targets;
+    }
+
+    private static int appendRedefineFailures(List<ReloadItemResult> items,
+                                              List<RedefineCandidate> candidates,
+                                              ReloadErrorCode code, OperationStatus status,
+                                              String diagnostic) {
+        for (RedefineCandidate candidate : candidates) {
+            items.add(item(candidate.update.getBinaryName(), status, code, diagnostic));
+        }
+        return candidates.size();
+    }
+
+    private static List<ReloadItemResult> orderedItems(List<ClassUpdate> updates,
+                                                       List<ReloadItemResult> items) {
+        Map<String, ReloadItemResult> byId = new LinkedHashMap<String, ReloadItemResult>();
+        for (ReloadItemResult item : items) byId.put(item.getItemId(), item);
+        List<ReloadItemResult> ordered = new ArrayList<ReloadItemResult>(updates.size());
+        for (ClassUpdate update : updates) {
+            ReloadItemResult result = byId.get(update.getBinaryName());
+            if (result != null) ordered.add(result);
+        }
+        return ordered;
+    }
+
+    private static String failureDetail(Throwable failure) {
+        if (failure == null) return "unknown";
+        Throwable root = failure;
+        while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+        String message = root.getMessage();
+        if (message == null || message.trim().isEmpty()) return root.getClass().getSimpleName();
+        message = message.replace('\r', ' ').replace('\n', ' ');
+        if (message.length() > 180) message = message.substring(0, 180);
+        return root.getClass().getSimpleName() + ":" + message;
     }
 
     private static boolean isStructureChange(UnsupportedOperationException failure) {
@@ -680,6 +853,22 @@ public final class ClassBatchReloader {
         private ItemOutcome(ReloadItemResult item, Class<?> loadedClass) {
             this.item = item;
             this.loadedClass = loadedClass;
+        }
+    }
+
+    private static final class RedefineCandidate {
+        private final ClassUpdate update;
+        private final Class<?> target;
+        private final ClassChangeAnalyzer.Analysis analysis;
+        private final boolean forceAnnotationPatch;
+
+        private RedefineCandidate(ClassUpdate update, Class<?> target,
+                                  ClassChangeAnalyzer.Analysis analysis,
+                                  boolean forceAnnotationPatch) {
+            this.update = update;
+            this.target = target;
+            this.analysis = analysis;
+            this.forceAnnotationPatch = forceAnnotationPatch;
         }
     }
 }

@@ -56,34 +56,42 @@ public final class ConfigResourceReloader {
             int applied = 0;
             int skipped = 0;
             int failed = 0;
-            List<ReloadItemResult> items = new ArrayList<ReloadItemResult>();
+            List<ContextChange> changes = new ArrayList<ContextChange>(contexts.size());
+            int failedContext = -1;
             for (int i = 0; i < contexts.size(); i++) {
-                Object context = contexts.get(i);
-                String detail = applyToContext(context, path, properties);
-                boolean ok = detail != null && detail.startsWith("ok");
-                boolean skip = detail != null && detail.startsWith("skipped");
-                if (ok) applied++;
-                if (skip) skipped++;
-                if (!ok && !skip) failed++;
-                items.add(new ReloadItemResult(path + "@ctx" + i,
-                        ok ? OperationStatus.SUCCESS
-                                : skip ? OperationStatus.SKIPPED : OperationStatus.FAILED,
-                        ok || skip ? null : ReloadErrorCode.INTERNAL_ERROR,
-                        ok ? "SUCCESS" : skip ? "SKIPPED" : "FAILED",
-                        detail == null ? "apply_failed" : detail));
+                ContextChange change = applyToContext(contexts.get(i), path, properties);
+                changes.add(change);
+                if (change.applied) applied++;
+                else if (change.skipped) skipped++;
+                else {
+                    failed++;
+                    failedContext = i;
+                    break;
+                }
             }
-            OperationStatus status = failed > 0 ? OperationStatus.FAILED
-                    : applied > 0 ? OperationStatus.SUCCESS : OperationStatus.SKIPPED;
-            ReloadErrorCode code = status == OperationStatus.FAILED
-                    ? ReloadErrorCode.INTERNAL_ERROR : null;
-            logger.log(status == OperationStatus.FAILED ? Level.WARNING : Level.INFO,
+            boolean rollbackFailed = failedContext >= 0
+                    && changes.get(failedContext).rollbackFailed;
+            if (failedContext >= 0) {
+                for (int i = changes.size() - 1; i >= 0; i--) {
+                    ContextChange change = changes.get(i);
+                    if (change.applied && !change.rollback()) rollbackFailed = true;
+                }
+            }
+            List<ReloadItemResult> items = contextItems(path, contexts.size(), changes, failedContext);
+            OperationStatus status = transactionStatus(failed, applied, rollbackFailed);
+            ReloadErrorCode code = failed > 0
+                    ? rollbackFailed ? ReloadErrorCode.ROLLBACK_FAILED : ReloadErrorCode.INTERNAL_ERROR
+                    : null;
+            logger.log(failed > 0 ? Level.WARNING : Level.INFO,
                     "CONFIG_RELOAD_RESULT", fields(
                     "requestId", request.getRequestId(),
                     "resourceId", path,
                     "resultCode", status.name(),
                     "detail", "keys=" + properties.size() + ",contexts=" + contexts.size()
                             + ",applied=" + applied + ",skipped=" + skipped
-                            + ",failed=" + failed
+                            + ",failed=" + failed + ",rolledBack="
+                            + (failedContext < 0 ? 0 : applied)
+                            + ",rollbackFailed=" + rollbackFailed
                             + ",ms=" + ((System.nanoTime() - started) / 1_000_000L)));
             return new ReloadResponse(request.getRequestId(), status, code,
                     status.name(), items);
@@ -104,6 +112,13 @@ public final class ConfigResourceReloader {
         String type = failure.getClass().getSimpleName();
         String message = failure.getMessage();
         return message == null || message.trim().isEmpty() ? type : type + ": " + message;
+    }
+
+    static OperationStatus transactionStatus(int failed, int applied, boolean rollbackFailed) {
+        if (failed > 0) {
+            return rollbackFailed ? OperationStatus.RESTART_REQUIRED : OperationStatus.FAILED;
+        }
+        return applied > 0 ? OperationStatus.SUCCESS : OperationStatus.SKIPPED;
     }
 
     static Map<String, String> parse(ResourceReloadRequest request) throws Exception {
@@ -308,21 +323,22 @@ public final class ConfigResourceReloader {
         return line;
     }
 
-    private static String applyToContext(Object context, String resourcePath, Map<String, String> properties) {
+    private static ContextChange applyToContext(Object context, String resourcePath,
+                                                Map<String, String> properties) {
         try {
             Object env = invoke(context, "getEnvironment");
-            if (env == null) return "no_environment";
+            if (env == null) return ContextChange.failed("no_environment");
             Object sources = invoke(env, "getPropertySources");
-            if (sources == null) return "no_property_sources";
+            if (sources == null) return ContextChange.failed("no_property_sources");
             String sourceName = "hotreload:" + resourcePath;
             Object existing = invoke(sources, "get", new Class<?>[]{String.class}, new Object[]{sourceName});
             List<String> originals = originalPropertySourceNames(sources, resourcePath, sourceName);
             Object mapSource = createMapPropertySource(env.getClass().getClassLoader(), sourceName, properties);
-            if (mapSource == null) return "map_source_unavailable";
-            return installReloadedPropertySource(sources, sourceName, mapSource, existing,
+            if (mapSource == null) return ContextChange.failed("map_source_unavailable");
+            return applyPropertySourceChange(sources, sourceName, mapSource, existing,
                     originals, properties.size());
         } catch (Throwable failure) {
-            return "error=" + failure.getClass().getSimpleName();
+            return ContextChange.failed("error=" + failure.getClass().getSimpleName());
         }
     }
 
@@ -333,23 +349,42 @@ public final class ConfigResourceReloader {
                 || propertyCount < 0) {
             return "property_source_update_unavailable";
         }
-        try {
-            if (existing != null) {
-                if (!installPropertySource(sources, sourceName, mapSource, true)) {
-                    return "property_source_update_unavailable";
+        return applyPropertySourceChange(sources, sourceName, mapSource, existing,
+                originals, propertyCount).detail;
+    }
+
+    private static ContextChange applyPropertySourceChange(Object sources, String sourceName,
+                                                           Object mapSource, Object existing,
+                                                           List<String> originals,
+                                                           int propertyCount) {
+        synchronized (sources) {
+            PropertySourcesSnapshot before = PropertySourcesSnapshot.capture(sources);
+            if (before == null) return ContextChange.failed("property_source_snapshot_unavailable");
+            String failure = null;
+            try {
+                if (existing != null) {
+                    if (!installPropertySource(sources, sourceName, mapSource, true)) {
+                        failure = "property_source_update_unavailable";
+                    } else if (!removePropertySources(sources, originals)) {
+                        failure = "original_property_source_remove_unavailable";
+                    }
+                } else if (originals.isEmpty()) {
+                    return ContextChange.skipped("skipped configuration_property_source_not_loaded");
+                } else if (!installReplacingPropertySourcesUnsafe(
+                        sources, sourceName, mapSource, originals)) {
+                    failure = "property_source_update_unavailable";
                 }
-                if (!removePropertySources(sources, originals)) {
-                    return "original_property_source_remove_unavailable";
-                }
-            } else if (originals.isEmpty()) {
-                return "skipped configuration_property_source_not_loaded";
-            } else if (!installReplacingPropertySources(sources, sourceName, mapSource, originals)) {
-                return "property_source_update_unavailable";
+            } catch (Throwable updateFailure) {
+                failure = "error=" + updateFailure.getClass().getSimpleName();
             }
-            return "ok keys=" + propertyCount + " source=" + sourceName
-                    + " originals=" + originals.size();
-        } catch (Throwable failure) {
-            return "error=" + failure.getClass().getSimpleName();
+            if (failure != null) {
+                boolean rolledBack = before.restore(sources);
+                return ContextChange.failed(failure + ",localRollback="
+                        + (rolledBack ? "ok" : "failed"), !rolledBack);
+            }
+            return ContextChange.applied(sources, before,
+                    "ok keys=" + propertyCount + " source=" + sourceName
+                            + " originals=" + originals.size());
         }
     }
 
@@ -446,6 +481,21 @@ public final class ConfigResourceReloader {
                 || originalSourceNames == null || originalSourceNames.isEmpty()) {
             return false;
         }
+        synchronized (sources) {
+            PropertySourcesSnapshot before = PropertySourcesSnapshot.capture(sources);
+            if (before == null) return false;
+            if (installReplacingPropertySourcesUnsafe(
+                    sources, sourceName, propertySource, originalSourceNames)) {
+                return true;
+            }
+            before.restore(sources);
+            return false;
+        }
+    }
+
+    private static boolean installReplacingPropertySourcesUnsafe(Object sources, String sourceName,
+                                                                  Object propertySource,
+                                                                  List<String> originalSourceNames) {
         if (!invokeCompatible(sources, "addBefore", originalSourceNames.get(0), propertySource)) {
             return false;
         }
@@ -459,6 +509,144 @@ public final class ConfigResourceReloader {
             removed &= removePropertySource(sources, sourceName);
         }
         return removed;
+    }
+
+    private static List<ReloadItemResult> contextItems(String path, int contextCount,
+                                                       List<ContextChange> changes,
+                                                       int failedContext) {
+        List<ReloadItemResult> items = new ArrayList<ReloadItemResult>(contextCount);
+        for (int i = 0; i < contextCount; i++) {
+            String itemId = path + "@ctx" + i;
+            if (i >= changes.size()) {
+                items.add(new ReloadItemResult(itemId, OperationStatus.SKIPPED, null,
+                        "SKIPPED", "transaction_aborted_after_context=" + failedContext));
+                continue;
+            }
+            ContextChange change = changes.get(i);
+            if (failedContext >= 0 && change.applied) {
+                boolean restored = change.rollbackAttempted && change.rollbackSucceeded;
+                ReloadErrorCode code = restored
+                        ? ReloadErrorCode.INTERNAL_ERROR : ReloadErrorCode.ROLLBACK_FAILED;
+                OperationStatus status = restored
+                        ? OperationStatus.FAILED : OperationStatus.RESTART_REQUIRED;
+                items.add(new ReloadItemResult(itemId, status, code,
+                        status.name(), restored
+                        ? "transaction_rolled_back_due_to_context=" + failedContext
+                        : "transaction_rollback_failed_due_to_context=" + failedContext));
+            } else if (change.applied) {
+                items.add(new ReloadItemResult(itemId, OperationStatus.SUCCESS, null,
+                        "SUCCESS", change.detail));
+            } else if (change.skipped) {
+                items.add(new ReloadItemResult(itemId, OperationStatus.SKIPPED, null,
+                        "SKIPPED", change.detail));
+            } else {
+                ReloadErrorCode code = change.rollbackFailed
+                        ? ReloadErrorCode.ROLLBACK_FAILED : ReloadErrorCode.INTERNAL_ERROR;
+                OperationStatus status = change.rollbackFailed
+                        ? OperationStatus.RESTART_REQUIRED : OperationStatus.FAILED;
+                items.add(new ReloadItemResult(itemId, status, code,
+                        status.name(), change.detail));
+            }
+        }
+        return items;
+    }
+
+    private static final class ContextChange {
+        private final Object sources;
+        private final PropertySourcesSnapshot before;
+        private final boolean applied;
+        private final boolean skipped;
+        private final String detail;
+        private final boolean rollbackFailed;
+        private boolean rollbackAttempted;
+        private boolean rollbackSucceeded;
+
+        private ContextChange(Object sources, PropertySourcesSnapshot before,
+                              boolean applied, boolean skipped, String detail,
+                              boolean rollbackFailed) {
+            this.sources = sources;
+            this.before = before;
+            this.applied = applied;
+            this.skipped = skipped;
+            this.detail = detail;
+            this.rollbackFailed = rollbackFailed;
+        }
+
+        private static ContextChange applied(Object sources, PropertySourcesSnapshot before,
+                                             String detail) {
+            return new ContextChange(sources, before, true, false, detail, false);
+        }
+
+        private static ContextChange skipped(String detail) {
+            return new ContextChange(null, null, false, true, detail, false);
+        }
+
+        private static ContextChange failed(String detail) {
+            return failed(detail, false);
+        }
+
+        private static ContextChange failed(String detail, boolean rollbackFailed) {
+            return new ContextChange(null, null, false, false, detail, rollbackFailed);
+        }
+
+        private boolean rollback() {
+            rollbackAttempted = true;
+            rollbackSucceeded = before != null && before.restore(sources);
+            return rollbackSucceeded;
+        }
+    }
+
+    private static final class PropertySourcesSnapshot {
+        private final List<Object> sources;
+        private final List<String> names;
+
+        private PropertySourcesSnapshot(List<Object> sources, List<String> names) {
+            this.sources = sources;
+            this.names = names;
+        }
+
+        private static PropertySourcesSnapshot capture(Object propertySources) {
+            if (!(propertySources instanceof Iterable)) return null;
+            List<Object> objects = new ArrayList<Object>();
+            List<String> names = new ArrayList<String>();
+            try {
+                for (Object source : (Iterable<?>) propertySources) {
+                    Object name = invoke(source, "getName");
+                    if (!(name instanceof String)) return null;
+                    objects.add(source);
+                    names.add((String) name);
+                }
+                return new PropertySourcesSnapshot(objects, names);
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+
+        private boolean restore(Object propertySources) {
+            if (propertySources == null) return false;
+            synchronized (propertySources) {
+                PropertySourcesSnapshot current = capture(propertySources);
+                if (current == null) return false;
+                boolean restored = true;
+                for (String name : current.names) {
+                    restored &= removePropertySource(propertySources, name);
+                }
+                for (Object source : sources) {
+                    restored &= invokeCompatible(propertySources, "addLast", source);
+                }
+                PropertySourcesSnapshot after = capture(propertySources);
+                return restored && sameAs(after);
+            }
+        }
+
+        private boolean sameAs(PropertySourcesSnapshot other) {
+            if (other == null || sources.size() != other.sources.size()) return false;
+            for (int i = 0; i < sources.size(); i++) {
+                if (sources.get(i) != other.sources.get(i)
+                        || !names.get(i).equals(other.names.get(i))) return false;
+            }
+            return true;
+        }
     }
 
     private ReloadResponse itemResponse(ResourceReloadRequest request, OperationStatus status,

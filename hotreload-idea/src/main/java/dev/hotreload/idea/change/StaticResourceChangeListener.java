@@ -55,9 +55,11 @@ public final class StaticResourceChangeListener implements BulkFileListener {
             if (!sessions.isStaticResourceReloadEnabled()) return;
             for (VFileEvent event : events) {
                 if (!removesOldLocation(event)) continue;
-                admittedLifecycleEvents.add(event);
                 List<ResourceLocation> locations = collect(event.getFile());
-                if (!locations.isEmpty()) locationsBeforeChange.put(event, locations);
+                if (!locations.isEmpty() && hasBoundDebugSession(locations)) {
+                    admittedLifecycleEvents.add(event);
+                    locationsBeforeChange.put(event, locations);
+                }
             }
         }
     }
@@ -114,10 +116,20 @@ public final class StaticResourceChangeListener implements BulkFileListener {
         ScanBudget budget = new ScanBudget();
         collect(file, locations, budget);
         if (budget.truncated) {
-            sessions.recordWarning("STATIC_RELOAD_SKIPPED", "file_event_too_large");
+            sessions.recordWarning("STATIC_RESTART_REQUIRED", "file_event_too_large");
             return Collections.emptyList();
         }
         return locations;
+    }
+
+    private boolean hasBoundDebugSession(List<ResourceLocation> locations) {
+        for (ResourceLocation location : locations) {
+            if (location != null && !sessions.activeDebugLaunchesForOutput(
+                    location.getOutputRoot()).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void collect(VirtualFile file, List<ResourceLocation> locations,
@@ -228,7 +240,8 @@ public final class StaticResourceChangeListener implements BulkFileListener {
         }
 
         private String key() {
-            return outputRoot.toAbsolutePath().normalize() + "\n" + resourceId;
+            return sourceRoot.toAbsolutePath().normalize() + "\n"
+                    + outputRoot.toAbsolutePath().normalize() + "\n" + resourceId;
         }
 
         public java.nio.file.Path getSourceRoot() { return sourceRoot; }

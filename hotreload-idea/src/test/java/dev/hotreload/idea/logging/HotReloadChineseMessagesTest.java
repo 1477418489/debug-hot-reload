@@ -10,6 +10,8 @@ class HotReloadChineseMessagesTest {
     void translatesKnownEvents() {
         assertEquals("类热更新结果", HotReloadChineseMessages.eventTitle("CLASS_BATCH_RESULT"));
         assertEquals("Mapper XML 热更新结果", HotReloadChineseMessages.eventTitle("XML_RELOAD_RESULT"));
+        assertEquals("Mapper XML 变更需要重启",
+                HotReloadChineseMessages.eventTitle("XML_RESTART_REQUIRED"));
         assertEquals("静态资源已同步到调试输出目录",
                 HotReloadChineseMessages.eventTitle("STATIC_RESOURCE_SYNCED"));
         assertEquals("静态资源已从调试输出目录删除",
@@ -60,20 +62,36 @@ class HotReloadChineseMessagesTest {
         String details = "status=FAILED itemId=com.demo.Foo "
                 + "detail=class_redefinition_failed:_虚拟机不支持的操作:_delete_method_not_implemented";
         String text = HotReloadChineseMessages.formatDetails("CLASS_BATCH_RESULT", details);
-        assertTrue(text.contains("删除方法") || text.contains("结构热更新") || text.contains("Generation"), text);
+        assertTrue(text.contains("删除方法") && text.contains("E2") && text.contains("E3无法"), text);
     }
 
     @Test
     void humanizesDeleteFieldJvmErrors() {
         String details = "status=FAILED detail=delete_field_not_implemented";
         String text = HotReloadChineseMessages.formatDetails("CLASS_BATCH_RESULT", details);
-        assertTrue(text.contains("字段") || text.contains("结构热更新") || text.contains("Generation") || text.contains("类结构"), text);
+        assertTrue(text.contains("删除字段") && text.contains("E2") && text.contains("E3无法"), text);
     }
 
     @Test
     void humanizesAddMethodJvmErrors() {
         String details = "status=FAILED detail=attempted_to_add_a_method";
         String text = HotReloadChineseMessages.formatDetails("CLASS_BATCH_RESULT", details);
-        assertTrue(text.contains("新增方法") || text.contains("结构热更新") || text.contains("Generation"), text);
+        assertTrue(text.contains("新增方法") && text.contains("直接Spring Bean"), text);
+    }
+
+    @Test
+    void explainsAmbiguousLoadedClassesWithoutClaimingRandomSelection() {
+        String text = HotReloadChineseMessages.formatDetails("CLASS_BATCH_RESULT",
+                "status=RESTART_REQUIRED detail=class_ambiguous loadedCount=2");
+
+        assertTrue(text.contains("拒绝猜测目标"), text);
+    }
+
+    @Test
+    void explainsWhyConditionalComponentsRequireRestart() {
+        String text = HotReloadChineseMessages.formatDetails("CLASS_BATCH_RESULT",
+                "status=RESTART_REQUIRED detail=conditionalBeanRegistrationRequiresRestart=com.demo.OptionalBean");
+
+        assertTrue(text.contains("不会绕过Spring注册条件"), text);
     }
 }

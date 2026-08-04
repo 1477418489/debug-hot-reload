@@ -19,6 +19,7 @@ import dev.hotreload.idea.change.MapperReloadQueue;
 import dev.hotreload.idea.change.MapperUpdateReader;
 import dev.hotreload.idea.change.ConfigFileChangeListener;
 import dev.hotreload.idea.change.ConfigUpdateReader;
+import dev.hotreload.idea.change.JavaSourceLifecycleListener;
 import dev.hotreload.idea.change.MapperXmlChangeListener;
 import dev.hotreload.idea.change.StaticResourceChangeListener;
 import dev.hotreload.idea.change.StaticResourceSynchronizer;
@@ -73,6 +74,8 @@ public final class HotReloadProjectService implements Disposable {
     private static final int MAX_PENDING_RESOURCE_TASKS = 256;
     // A directory rename is admitted as one ordered batch, but each resource still consumes a unit.
     private static final int MAX_PENDING_STATIC_RESOURCE_OPERATIONS = 8_192;
+    private static final int STATIC_COMMITTED_RETRY_LIMIT = 20;
+    private static final long STATIC_COMMITTED_RETRY_MILLIS = 50L;
 
     private final ScheduledExecutorService scheduler = AppExecutorUtil.getAppScheduledExecutorService();
     private final BoundedResourceExecutor configResourceExecutor = new BoundedResourceExecutor(
@@ -101,13 +104,14 @@ public final class HotReloadProjectService implements Disposable {
         diagnostics = new PluginSessionDiagnostics(project.getLocationHash(),
                 logBuffer == null ? new HotReloadLogBuffer() : logBuffer);
         mapperQueue = new MapperReloadQueue(scheduler, XML_DEBOUNCE_MILLIS, MAX_PENDING_XML,
-                (launchId, sourceRoot, outputRoot, file) -> executeMapperResourceTask(
+                (launchId, sourceRoot, outputRoot, file) -> executeMapperResourceTask(launchId,
                         () -> readAndReloadMapper(launchId, sourceRoot, outputRoot, file)));
         MessageBusConnection connection = project.getMessageBus().connect(this);
         connection.subscribe(ExecutionManager.EXECUTION_TOPIC, new DebugExecutionListener(this));
         connection.subscribe(VirtualFileManager.VFS_CHANGES, new MapperXmlChangeListener(project, this));
         connection.subscribe(VirtualFileManager.VFS_CHANGES, new ConfigFileChangeListener(project, this));
         connection.subscribe(VirtualFileManager.VFS_CHANGES, new StaticResourceChangeListener(project, this));
+        connection.subscribe(VirtualFileManager.VFS_CHANGES, new JavaSourceLifecycleListener(project, this));
         connection.subscribe(CompilerTopics.COMPILATION_STATUS, new ClassCompilationListener(this));
         // 上次 IDE 崩溃可能留下未恢复的内置 HotSwap 覆盖；无活跃会话时启动即还原。
         IdeaBuiltinHotSwapGuard.recoverStaleOverride(diagnostics);
@@ -302,13 +306,13 @@ public final class HotReloadProjectService implements Disposable {
 
     public void scheduleConfigReload(Path sourceRoot, Path outputRoot, Path file) {
         if (!isConfigReloadEnabled()) return;
-        String launchId = activeDebugLaunchForOutput(outputRoot);
-        if (launchId == null) {
+        List<String> launchIds = activeDebugLaunchesForOutput(outputRoot);
+        if (launchIds.isEmpty()) {
             recordWarning("CONFIG_RELOAD_SKIPPED", "debug_session_not_bound_at_save");
             return;
         }
         executeConfigResourceTask(() -> readAndReloadConfig(
-                launchId, sourceRoot, outputRoot, file));
+                launchIds, sourceRoot, outputRoot, file));
     }
 
     private void executeConfigResourceTask(Runnable task) {
@@ -318,7 +322,7 @@ public final class HotReloadProjectService implements Disposable {
         }
     }
 
-    private void readAndReloadConfig(String expectedLaunchId, Path sourceRoot,
+    private void readAndReloadConfig(List<String> expectedLaunchIds, Path sourceRoot,
                                      Path outputRoot, Path file) {
         if (!isConfigReloadEnabled()) return;
         ConfigUpdateReader.Result update;
@@ -329,63 +333,73 @@ public final class HotReloadProjectService implements Disposable {
                     "source", String.valueOf(file));
             return;
         }
-        RunningSessionRegistry.Session session = activeSessions.get(expectedLaunchId);
-        if (session == null || !expectedLaunchId.equals(session.getLaunchId())) {
-            diagnostics.warn("CONFIG_RELOAD_SKIPPED", session == null ? null : session.getLaunchId(),
-                    "reason", session == null ? missingSessionReason(expectedLaunchId)
-                            : "debug_session_changed");
-            return;
-        }
-        LaunchState launch = launch(expectedLaunchId);
-        if (launch == null) {
-            diagnostics.warn("CONFIG_RELOAD_SKIPPED", expectedLaunchId,
-                    "reason", "launch_state_missing",
-                    "resourceId", update.getResourceId());
-            return;
-        }
-        DebugClasspathMatcher.Decision decision = DebugClasspathMatcher.evaluateLoadedResource(
-                outputRoot, update.getResourceId(), launch.classpathEntries);
-        if (!decision.isAccepted()) {
-            diagnostics.warn("CONFIG_RELOAD_SKIPPED", expectedLaunchId,
-                    "reason", decision.reason(),
-                    "resourceId", update.getResourceId(),
-                    "detail", decision.summary());
-            return;
-        }
-        if (!isConfigReloadEnabled()) return;
         String resourcePath = update.getResourceId();
         byte[] content = update.getContent();
         String type = resourcePath.toLowerCase(Locale.ROOT).endsWith(".properties")
                 ? "properties" : "yaml";
-        diagnostics.info("CONFIG_RELOAD_SEND", session.getLaunchId(),
-                "resourceId", resourcePath, "contentType", type,
-                "payloadBytes", Integer.toString(content.length));
-        CompletableFuture<ReloadResponse> future =
-                session.getClient().reloadResource(resourcePath, content, type);
-        observe(session, "CONFIG_RELOAD_RESULT", future);
-        awaitObserved(future);
+        for (String expectedLaunchId : expectedLaunchIds) {
+            RunningSessionRegistry.Session session = activeSessions.get(expectedLaunchId);
+            if (session == null || !expectedLaunchId.equals(session.getLaunchId())) {
+                diagnostics.warn("CONFIG_RELOAD_SKIPPED", session == null ? null : session.getLaunchId(),
+                        "reason", session == null ? missingSessionReason(expectedLaunchId)
+                                : "debug_session_changed");
+                continue;
+            }
+            LaunchState launch = launch(expectedLaunchId);
+            if (launch == null) {
+                diagnostics.warn("CONFIG_RELOAD_SKIPPED", expectedLaunchId,
+                        "reason", "launch_state_missing", "resourceId", resourcePath);
+                continue;
+            }
+            DebugClasspathMatcher.Decision decision = DebugClasspathMatcher.evaluateLoadedResource(
+                    outputRoot, resourcePath, launch.classpathEntries);
+            if (!decision.isAccepted()) {
+                diagnostics.warn("CONFIG_RELOAD_SKIPPED", expectedLaunchId,
+                        "reason", decision.reason(), "resourceId", resourcePath,
+                        "detail", decision.summary());
+                continue;
+            }
+            if (!isConfigReloadEnabled()) return;
+            diagnostics.info("CONFIG_RELOAD_SEND", session.getLaunchId(),
+                    "resourceId", resourcePath, "contentType", type,
+                    "payloadBytes", Integer.toString(content.length));
+            CompletableFuture<ReloadResponse> future =
+                    session.getClient().reloadResource(resourcePath, content, type);
+            observe(session, "CONFIG_RELOAD_RESULT", future);
+            awaitObserved(future);
+        }
     }
 
     public void scheduleStaticResourceReload(Path sourceRoot, Path outputRoot, Path file) {
         if (!isStaticResourceReloadEnabled()) return;
-        String launchId = activeDebugLaunchForOutput(outputRoot);
-        if (launchId == null) {
+        List<String> launchIds = activeDebugLaunchesForOutput(outputRoot);
+        if (launchIds.isEmpty()) {
             recordWarning("STATIC_RELOAD_SKIPPED", "debug_session_not_bound_at_save");
             return;
         }
-        executeStaticResourceTask(() -> synchronizeAndReloadStaticResource(
-                launchId, sourceRoot, outputRoot, file));
+        String primaryLaunchId = launchIds.get(0);
+        executeStaticResourceTask(() -> {
+            List<StaticResourceNotification> notifications = new ArrayList<StaticResourceNotification>(1);
+            synchronizeAndReloadStaticResource(primaryLaunchId, sourceRoot, outputRoot, file,
+                    false, notifications, launchIds);
+            notifyStaticResourceChanges(notifications);
+        });
     }
 
     public void scheduleStaticResourceRemoval(Path outputRoot, String resourceId) {
         if (!isStaticResourceReloadEnabled()) return;
-        String launchId = activeDebugLaunchForOutput(outputRoot);
-        if (launchId == null) {
+        List<String> launchIds = activeDebugLaunchesForOutput(outputRoot);
+        if (launchIds.isEmpty()) {
             recordWarning("STATIC_RELOAD_SKIPPED", "debug_session_not_bound_at_save");
             return;
         }
-        executeStaticResourceTask(() -> removeAndReloadStaticResource(
-                launchId, outputRoot, resourceId));
+        String primaryLaunchId = launchIds.get(0);
+        executeStaticResourceTask(() -> {
+            List<StaticResourceNotification> notifications = new ArrayList<StaticResourceNotification>(1);
+            removeAndReloadStaticResource(primaryLaunchId, outputRoot, resourceId,
+                    false, notifications, launchIds);
+            notifyStaticResourceChanges(notifications);
+        });
     }
 
     public void scheduleStaticResourceChanges(
@@ -417,22 +431,20 @@ public final class HotReloadProjectService implements Disposable {
                 StaticResourceChangeListener.ResourceLocation location = change.location;
                 try {
                     if (change.removal) {
-                        removeAndReloadStaticResource(change.launchId,
-                                location.getOutputRoot(), location.getResourceId(), true, notifications);
+                        removeAndReloadStaticResource(change.primaryLaunchId(),
+                                location.getOutputRoot(), location.getResourceId(), committedLifecycle,
+                                notifications, change.launchIds);
                     } else {
-                        synchronizeAndReloadStaticResource(change.launchId,
+                        synchronizeAndReloadStaticResource(change.primaryLaunchId(),
                                 location.getSourceRoot(), location.getOutputRoot(),
-                                location.getSourceFile(), true, notifications);
+                                location.getSourceFile(), committedLifecycle, notifications, change.launchIds);
                     }
                 } catch (RuntimeException failure) {
-                    logStaticSyncFailure(change.launchId, failure);
+                    logStaticSyncFailure(change.primaryLaunchId(), failure);
                 }
             }
-            for (StaticResourceNotification notification : notifications) {
-                notifyStaticResourceChange(notification.launchId, notification.outputRoot,
-                        notification.resourceId);
-            }
-        }, changes.size());
+            notifyStaticResourceChanges(notifications);
+        }, changes.size(), committedLifecycle);
     }
 
     private void bindStaticResourceChanges(List<BoundStaticResourceChange> target,
@@ -441,12 +453,12 @@ public final class HotReloadProjectService implements Disposable {
         if (locations == null) return;
         for (StaticResourceChangeListener.ResourceLocation location : locations) {
             if (location == null) continue;
-            String launchId = activeDebugLaunchForOutput(location.getOutputRoot());
-            if (launchId == null && !committedLifecycle) {
+            List<String> launchIds = activeDebugLaunchesForOutput(location.getOutputRoot());
+            if (launchIds.isEmpty() && !committedLifecycle) {
                 recordWarning("STATIC_RELOAD_SKIPPED", "debug_session_not_bound_at_save");
                 continue;
             }
-            target.add(new BoundStaticResourceChange(launchId, location, removal));
+            target.add(new BoundStaticResourceChange(launchIds, location, removal));
         }
     }
 
@@ -455,22 +467,49 @@ public final class HotReloadProjectService implements Disposable {
     }
 
     private void executeStaticResourceTask(Runnable task, int workUnits) {
+        executeStaticResourceTask(task, workUnits, false);
+    }
+
+    private void executeStaticResourceTask(Runnable task, int workUnits, boolean committedLifecycle) {
         if (disposed.get()) return;
-        if (!staticResourceExecutor.execute(task, workUnits)) {
+        if (staticResourceExecutor.execute(task, workUnits)) return;
+        if (committedLifecycle) {
+            retryCommittedStaticResourceTask(task, workUnits, 1);
+        } else {
             recordWarning("STATIC_RELOAD_SKIPPED", "queue_full_or_closed");
+        }
+    }
+
+    private void retryCommittedStaticResourceTask(Runnable task, int workUnits, int attempt) {
+        if (disposed.get()) return;
+        if (workUnits > MAX_PENDING_STATIC_RESOURCE_OPERATIONS) {
+            recordWarning("STATIC_RESTART_REQUIRED", "batch_exceeds_queue_capacity");
+            return;
+        }
+        if (staticResourceExecutor.execute(task, workUnits)) return;
+        if (attempt >= STATIC_COMMITTED_RETRY_LIMIT) {
+            recordWarning("STATIC_RESTART_REQUIRED", "queue_busy_after_retries");
+            return;
+        }
+        try {
+            scheduler.schedule(() -> retryCommittedStaticResourceTask(task, workUnits, attempt + 1),
+                    STATIC_COMMITTED_RETRY_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException rejected) {
+            recordWarning("STATIC_RESTART_REQUIRED", "queue_full_or_closed");
         }
     }
 
     private void synchronizeAndReloadStaticResource(String expectedLaunchId, Path sourceRoot,
                                                     Path outputRoot, Path file) {
         synchronizeAndReloadStaticResource(expectedLaunchId, sourceRoot, outputRoot, file,
-                false, null);
+                false, null, Collections.singletonList(expectedLaunchId));
     }
 
     private void synchronizeAndReloadStaticResource(String expectedLaunchId, Path sourceRoot,
                                                      Path outputRoot, Path file,
                                                      boolean committedBatch,
-                                                     List<StaticResourceNotification> notifications) {
+                                                     List<StaticResourceNotification> notifications,
+                                                     List<String> notificationLaunchIds) {
         if (!committedBatch && !isStaticResourceReloadEnabled()) return;
         final String resourceId;
         try {
@@ -481,28 +520,15 @@ public final class HotReloadProjectService implements Disposable {
         }
 
         if (!committedBatch) {
-            RunningSessionRegistry.Session session = activeSessions.get(expectedLaunchId);
-            if (session == null || !expectedLaunchId.equals(session.getLaunchId())) {
-                diagnostics.warn("STATIC_RELOAD_SKIPPED", session == null ? null : session.getLaunchId(),
-                        "reason", session == null ? missingSessionReason(expectedLaunchId)
-                                : "debug_session_changed");
-                return;
-            }
-            LaunchState launch = launch(expectedLaunchId);
-            if (launch == null) {
+            List<String> validLaunchIds = validStaticLaunches(outputRoot, resourceId,
+                    notificationLaunchIds);
+            if (validLaunchIds.isEmpty()) {
                 diagnostics.warn("STATIC_RELOAD_SKIPPED", expectedLaunchId,
-                        "reason", "launch_state_missing");
+                        "reason", "resource_not_loaded_or_debug_session_changed");
                 return;
             }
-            DebugClasspathMatcher.Decision decision = DebugClasspathMatcher.evaluateOrderedResource(
-                    outputRoot, resourceId, launch.classpathEntries);
-            boolean shadowed = decision.getCode()
-                    == DebugClasspathMatcher.DecisionCode.RESOURCE_SHADOWED;
-            if (!decision.isAccepted() && !shadowed) {
-                diagnostics.warn("STATIC_RELOAD_SKIPPED", expectedLaunchId,
-                        "reason", decision.reason(), "detail", decision.summary());
-                return;
-            }
+            expectedLaunchId = validLaunchIds.get(0);
+            notificationLaunchIds = validLaunchIds;
             if (!isStaticResourceReloadEnabled()) return;
         }
 
@@ -523,7 +549,7 @@ public final class HotReloadProjectService implements Disposable {
                 "payloadBytes", Integer.toString(synchronizedResource.getContentLength()));
 
         if (notifications != null) {
-            notifications.add(new StaticResourceNotification(expectedLaunchId, outputRoot,
+            notifications.add(new StaticResourceNotification(notificationLaunchIds, outputRoot,
                     synchronizedResource.getResourceId()));
             return;
         }
@@ -533,36 +559,25 @@ public final class HotReloadProjectService implements Disposable {
 
     private void removeAndReloadStaticResource(String expectedLaunchId, Path outputRoot,
                                                String resourceId) {
-        removeAndReloadStaticResource(expectedLaunchId, outputRoot, resourceId, false, null);
+        removeAndReloadStaticResource(expectedLaunchId, outputRoot, resourceId, false, null,
+                Collections.singletonList(expectedLaunchId));
     }
 
     private void removeAndReloadStaticResource(String expectedLaunchId, Path outputRoot,
-                                               String resourceId, boolean committedBatch,
-                                               List<StaticResourceNotification> notifications) {
+                                                String resourceId, boolean committedBatch,
+                                                List<StaticResourceNotification> notifications,
+                                                List<String> notificationLaunchIds) {
         if (!committedBatch && !isStaticResourceReloadEnabled()) return;
         if (!committedBatch) {
-            RunningSessionRegistry.Session session = activeSessions.get(expectedLaunchId);
-            LaunchState launch = launch(expectedLaunchId);
-            if (session == null || !expectedLaunchId.equals(session.getLaunchId())) {
-                diagnostics.warn("STATIC_RELOAD_SKIPPED", session == null ? null : session.getLaunchId(),
-                        "reason", session == null ? missingSessionReason(expectedLaunchId)
-                                : "debug_session_changed");
-                return;
-            }
-            if (launch == null) {
+            List<String> validLaunchIds = validStaticLaunches(outputRoot, resourceId,
+                    notificationLaunchIds);
+            if (validLaunchIds.isEmpty()) {
                 diagnostics.warn("STATIC_RELOAD_SKIPPED", expectedLaunchId,
-                        "reason", "launch_state_missing");
+                        "reason", "resource_not_loaded_or_debug_session_changed");
                 return;
             }
-            DebugClasspathMatcher.Decision decision = DebugClasspathMatcher.evaluateOrderedResource(
-                    outputRoot, resourceId, launch.classpathEntries);
-            boolean shadowed = decision.getCode()
-                    == DebugClasspathMatcher.DecisionCode.RESOURCE_SHADOWED;
-            if (!decision.isAccepted() && !shadowed) {
-                diagnostics.warn("STATIC_RELOAD_SKIPPED", expectedLaunchId,
-                        "reason", decision.reason(), "detail", decision.summary());
-                return;
-            }
+            expectedLaunchId = validLaunchIds.get(0);
+            notificationLaunchIds = validLaunchIds;
             if (!isStaticResourceReloadEnabled()) return;
         }
 
@@ -578,11 +593,42 @@ public final class HotReloadProjectService implements Disposable {
                 "removed", Boolean.toString(removal.wasRemoved()));
 
         if (notifications != null) {
-            notifications.add(new StaticResourceNotification(expectedLaunchId, outputRoot,
+            notifications.add(new StaticResourceNotification(notificationLaunchIds, outputRoot,
                     removal.getResourceId()));
             return;
         }
         notifyStaticResourceChange(expectedLaunchId, outputRoot, removal.getResourceId());
+    }
+
+    /** Re-check ownership at execution time because a Debug session may end during debounce. */
+    private List<String> validStaticLaunches(Path outputRoot, String resourceId,
+                                              List<String> preferredLaunchIds) {
+        LinkedHashSet<String> candidates = new LinkedHashSet<String>();
+        if (preferredLaunchIds != null) candidates.addAll(preferredLaunchIds);
+        candidates.addAll(activeDebugLaunchesForOutput(outputRoot));
+        List<String> valid = new ArrayList<String>();
+        for (String launchId : candidates) {
+            if (launchId == null || launchId.isEmpty()) continue;
+            RunningSessionRegistry.Session session = activeSessions.get(launchId);
+            LaunchState launch = launch(launchId);
+            if (session == null || launch == null || !launchId.equals(session.getLaunchId())) continue;
+            DebugClasspathMatcher.Decision decision = DebugClasspathMatcher.evaluateOrderedResource(
+                    outputRoot, resourceId, launch.classpathEntries);
+            if (decision.isAccepted()
+                    || decision.getCode() == DebugClasspathMatcher.DecisionCode.RESOURCE_SHADOWED) {
+                valid.add(launchId);
+            }
+        }
+        return valid;
+    }
+
+    private void notifyStaticResourceChanges(List<StaticResourceNotification> notifications) {
+        for (StaticResourceNotification notification : notifications) {
+            for (String launchId : notification.launchIds) {
+                notifyStaticResourceChange(launchId, notification.outputRoot,
+                        notification.resourceId);
+            }
+        }
     }
 
     private void notifyStaticResourceChange(String expectedLaunchId, Path outputRoot,
@@ -665,20 +711,21 @@ public final class HotReloadProjectService implements Disposable {
 
     public void scheduleMapperReload(Path sourceRoot, Path outputRoot, Path file) {
         if (!isMapperReloadEnabled()) return;
-        String launchId = activeDebugLaunchForOutput(outputRoot);
-        if (launchId == null) {
+        List<String> launchIds = activeDebugLaunchesForOutput(outputRoot);
+        if (launchIds.isEmpty()) {
             recordWarning("XML_RELOAD_SKIPPED", "debug_session_not_bound_at_save");
             return;
         }
-        if (!mapperQueue.schedule(launchId, sourceRoot, outputRoot, file)) {
-            recordWarning("XML_QUEUE_REJECTED", "queue_full_or_closed");
+        if (!mapperQueue.scheduleAll(launchIds, sourceRoot, outputRoot, file)) {
+            recordWarning("XML_RESTART_REQUIRED", "queue_full_or_closed");
         }
     }
 
-    private void executeMapperResourceTask(Runnable task) {
-        if (disposed.get()) return;
+    private void executeMapperResourceTask(String launchId, Runnable task) {
+        if (disposed.get() || !isMapperReloadEnabled()) return;
         if (!mapperResourceExecutor.execute(task)) {
-            recordWarning("XML_QUEUE_REJECTED", "queue_full_or_closed");
+            diagnostics.warn("XML_RESTART_REQUIRED", launchId,
+                    "reason", "queue_full_or_closed");
         }
     }
 
@@ -705,22 +752,33 @@ public final class HotReloadProjectService implements Disposable {
     }
 
     public String activeDebugLaunchForOutput(Path outputRoot) {
-        String match = null;
+        List<String> matches = activeDebugLaunchesForOutput(outputRoot);
+        return matches.size() == 1 ? matches.get(0) : null;
+    }
+
+    public List<String> activeDebugLaunchesForOutput(Path outputRoot) {
+        List<String> matches = new ArrayList<String>();
         for (RunningSessionRegistry.Session session : activeSessions.snapshot()) {
             LaunchState state = launch(session.getLaunchId());
             if (state == null || !DebugClasspathMatcher.containsOutputRoot(
                     outputRoot, state.classpathEntries)) {
                 continue;
             }
-            if (match != null) return null;
-            match = session.getLaunchId();
+            matches.add(session.getLaunchId());
         }
-        return match;
+        return Collections.unmodifiableList(matches);
     }
 
     public String activeDebugLaunchForClass(Path outputRoot, String relativePath) {
-        if (outputRoot == null || relativePath == null || relativePath.isEmpty()) return null;
-        String match = null;
+        List<String> matches = activeDebugLaunchesForClass(outputRoot, relativePath);
+        return matches.size() == 1 ? matches.get(0) : null;
+    }
+
+    public List<String> activeDebugLaunchesForClass(Path outputRoot, String relativePath) {
+        if (outputRoot == null || relativePath == null || relativePath.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> matches = new ArrayList<String>();
         for (RunningSessionRegistry.Session session : activeSessions.snapshot()) {
             LaunchState state = launch(session.getLaunchId());
             if (state == null) continue;
@@ -729,10 +787,9 @@ public final class HotReloadProjectService implements Disposable {
             DebugClasspathMatcher.Decision decision = DebugClasspathMatcher.evaluateOrderedResource(
                     outputRoot, relativePath, state.classpathEntries);
             if (!decision.isAccepted()) continue;
-            if (match != null) return null;
-            match = session.getLaunchId();
+            matches.add(session.getLaunchId());
         }
-        return match;
+        return Collections.unmodifiableList(matches);
     }
 
     public void recordWarning(String event, String reason) {
@@ -1164,26 +1221,32 @@ public final class HotReloadProjectService implements Disposable {
     }
 
     private static final class BoundStaticResourceChange {
-        private final String launchId;
+        private final List<String> launchIds;
         private final StaticResourceChangeListener.ResourceLocation location;
         private final boolean removal;
 
-        private BoundStaticResourceChange(String launchId,
-                                          StaticResourceChangeListener.ResourceLocation location,
-                                          boolean removal) {
-            this.launchId = launchId;
+        private BoundStaticResourceChange(List<String> launchIds,
+                                           StaticResourceChangeListener.ResourceLocation location,
+                                           boolean removal) {
+            this.launchIds = launchIds == null ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(launchIds));
             this.location = location;
             this.removal = removal;
+        }
+
+        private String primaryLaunchId() {
+            return launchIds.isEmpty() ? null : launchIds.get(0);
         }
     }
 
     private static final class StaticResourceNotification {
-        private final String launchId;
+        private final List<String> launchIds;
         private final Path outputRoot;
         private final String resourceId;
 
-        private StaticResourceNotification(String launchId, Path outputRoot, String resourceId) {
-            this.launchId = launchId;
+        private StaticResourceNotification(List<String> launchIds, Path outputRoot, String resourceId) {
+            this.launchIds = launchIds == null ? Collections.<String>emptyList()
+                    : Collections.unmodifiableList(new ArrayList<String>(launchIds));
             this.outputRoot = outputRoot;
             this.resourceId = resourceId;
         }

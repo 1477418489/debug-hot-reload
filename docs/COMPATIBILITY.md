@@ -2,7 +2,7 @@
 
 ## Product baseline
 
-- **Version**: 1.0.0 (initial enhanced-redefine baseline)
+- **Version**: 1.0.1 (initial enhanced-redefine baseline patch)
 - **Goal**: JRebel-grade hot reload for Spring / Spring Boot / MyBatis Debug development
 
 ## Supported
@@ -24,13 +24,15 @@
 |---|---|---|
 | E2 enhanced redefine (primary) | DCEVM / JBR 17+ | Class identity kept, live instances & state preserved |
 | E1 standard redefine | any JVM | Method bodies only |
-| E3 generation fallback | any JVM | Assignable-subclass scheme, Spring beans only |
+| E3 generation fallback | any JVM | Additive changes representable by an assignable subclass; direct Spring beans only |
 
 Notes:
 - DCEVM-8 sessions additionally get `-XX:TieredStopAtLevel=1` to avoid a known
   non-deterministic C2 JIT crash after redefinition (VM-level DCEVM issue).
 - JBR flag is injected only for JDK 17+ with `IMPLEMENTOR=JetBrains` in the release file;
   DCEVM only when the altjvm directory actually contains a JVM library.
+- E3 reports success only after the corresponding direct Spring bean is rebound. Member
+  removal/retyping, hierarchy changes, and non-Spring structural changes require E2 or restart.
 
 ## Capability adaptation
 

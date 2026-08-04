@@ -1,8 +1,14 @@
 package dev.hotreload.idea.change;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.RejectedExecutionException;
@@ -35,11 +41,24 @@ public final class MapperReloadQueue implements AutoCloseable {
     }
 
     public synchronized boolean schedule(String launchId, Path sourceRoot, Path outputRoot, Path file) {
-        if (launchId == null || launchId.isEmpty()
-                || sourceRoot == null || outputRoot == null || file == null) {
-            throw new NullPointerException("launchId and paths are required");
+        return scheduleAll(Collections.singletonList(launchId), sourceRoot, outputRoot, file);
+    }
+
+    /** Admits all matching Debug sessions atomically so one save cannot update only a subset. */
+    public synchronized boolean scheduleAll(Iterable<String> launchIds, Path sourceRoot,
+                                            Path outputRoot, Path file) {
+        if (launchIds == null || sourceRoot == null || outputRoot == null || file == null) {
+            throw new NullPointerException("launchIds and paths are required");
         }
         if (closed) return false;
+        Set<String> uniqueLaunchIds = new LinkedHashSet<String>();
+        for (String launchId : launchIds) {
+            if (launchId == null || launchId.isEmpty()) {
+                throw new NullPointerException("launchId is required");
+            }
+            uniqueLaunchIds.add(launchId);
+        }
+        if (uniqueLaunchIds.isEmpty()) return false;
         final Path canonicalSource;
         final Path canonicalOutput;
         final Path key;
@@ -50,21 +69,37 @@ public final class MapperReloadQueue implements AutoCloseable {
         } catch (Exception e) {
             return false;
         }
-        QueueKey queueKey = new QueueKey(canonicalSource, canonicalOutput, key);
-        Entry previous = pending.get(queueKey);
-        if (previous == null && pending.size() >= capacity) return false;
-        if (previous != null) previous.future.cancel(false);
+        List<QueueKey> queueKeys = new ArrayList<QueueKey>(uniqueLaunchIds.size());
+        int newEntries = 0;
+        for (String launchId : uniqueLaunchIds) {
+            QueueKey queueKey = new QueueKey(launchId, canonicalSource, canonicalOutput, key);
+            queueKeys.add(queueKey);
+            if (!pending.containsKey(queueKey)) newEntries++;
+        }
+        if (newEntries > capacity - pending.size()) return false;
 
-        Entry entry = new Entry(launchId, canonicalSource, canonicalOutput, key, queueKey);
-        pending.put(queueKey, entry);
+        Map<QueueKey, Entry> staged = new LinkedHashMap<QueueKey, Entry>();
         try {
-            entry.future = scheduler.schedule(() -> fire(entry), delayMillis,
-                    TimeUnit.MILLISECONDS);
-            return true;
+            int index = 0;
+            for (String launchId : uniqueLaunchIds) {
+                QueueKey queueKey = queueKeys.get(index++);
+                Entry entry = new Entry(launchId, canonicalSource, canonicalOutput, key, queueKey);
+                entry.future = scheduler.schedule(() -> fire(entry), delayMillis,
+                        TimeUnit.MILLISECONDS);
+                staged.put(queueKey, entry);
+            }
         } catch (RejectedExecutionException rejected) {
-            if (pending.get(queueKey) == entry) pending.remove(queueKey);
+            cancel(staged.values());
+            return false;
+        } catch (RuntimeException rejected) {
+            cancel(staged.values());
             return false;
         }
+        for (Map.Entry<QueueKey, Entry> stagedEntry : staged.entrySet()) {
+            Entry previous = pending.put(stagedEntry.getKey(), stagedEntry.getValue());
+            if (previous != null && previous.future != null) previous.future.cancel(false);
+        }
+        return true;
     }
 
     public synchronized int getPendingCount() {
@@ -88,6 +123,12 @@ public final class MapperReloadQueue implements AutoCloseable {
         pending.clear();
     }
 
+    private static void cancel(Iterable<Entry> entries) {
+        for (Entry entry : entries) {
+            if (entry != null && entry.future != null) entry.future.cancel(false);
+        }
+    }
+
     private static final class Entry {
         private final String launchId;
         private final Path sourceRoot;
@@ -107,11 +148,13 @@ public final class MapperReloadQueue implements AutoCloseable {
     }
 
     private static final class QueueKey {
+        private final String launchId;
         private final Path sourceRoot;
         private final Path outputRoot;
         private final Path file;
 
-        private QueueKey(Path sourceRoot, Path outputRoot, Path file) {
+        private QueueKey(String launchId, Path sourceRoot, Path outputRoot, Path file) {
+            this.launchId = launchId;
             this.sourceRoot = sourceRoot;
             this.outputRoot = outputRoot;
             this.file = file;
@@ -121,13 +164,15 @@ public final class MapperReloadQueue implements AutoCloseable {
             if (this == other) return true;
             if (!(other instanceof QueueKey)) return false;
             QueueKey that = (QueueKey) other;
-            return sourceRoot.equals(that.sourceRoot)
+            return launchId.equals(that.launchId)
+                    && sourceRoot.equals(that.sourceRoot)
                     && outputRoot.equals(that.outputRoot)
                     && file.equals(that.file);
         }
 
         @Override public int hashCode() {
-            int result = sourceRoot.hashCode();
+            int result = launchId.hashCode();
+            result = 31 * result + sourceRoot.hashCode();
             result = 31 * result + outputRoot.hashCode();
             return 31 * result + file.hashCode();
         }

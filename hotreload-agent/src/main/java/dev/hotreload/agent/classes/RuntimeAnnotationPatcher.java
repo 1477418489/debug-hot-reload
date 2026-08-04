@@ -31,22 +31,27 @@ public final class RuntimeAnnotationPatcher {
     public static final class PatchReport {
         private final int methodsPatched;
         private final int classPatched;
+        private final int failures;
         private final List<String> diffs;
 
-        PatchReport(int methodsPatched, int classPatched, List<String> diffs) {
+        PatchReport(int methodsPatched, int classPatched, int failures, List<String> diffs) {
             this.methodsPatched = methodsPatched;
             this.classPatched = classPatched;
+            this.failures = failures;
             this.diffs = diffs;
         }
 
         public int getMethodsPatched() { return methodsPatched; }
         public int getClassPatched() { return classPatched; }
+        public int getFailures() { return failures; }
+        public boolean isComplete() { return failures == 0; }
         public List<String> getDiffs() { return diffs; }
 
         public String summary() {
             StringBuilder builder = new StringBuilder(96);
             builder.append("annotationPatch=methods=").append(methodsPatched)
-                    .append(",class=").append(classPatched);
+                    .append(",class=").append(classPatched)
+                    .append(",failures=").append(failures);
             if (!diffs.isEmpty()) {
                 builder.append(",diff=");
                 for (int i = 0; i < diffs.size(); i++) {
@@ -64,12 +69,13 @@ public final class RuntimeAnnotationPatcher {
 
     public static PatchReport patch(Class<?> type, byte[] bytecode) {
         if (type == null || bytecode == null || bytecode.length == 0) {
-            return new PatchReport(0, 0, Collections.<String>emptyList());
+            return new PatchReport(0, 0, 0, Collections.<String>emptyList());
         }
         AnnotationModel model = AnnotationModel.read(bytecode, type.getClassLoader());
         List<String> diffs = new ArrayList<String>();
         int methodsPatched = 0;
         int classPatched = 0;
+        int failures = 0;
 
         Map<Class<? extends Annotation>, Annotation> classRuntime = currentAnnotations(type);
         Map<Class<? extends Annotation>, Annotation> classDesired = model.classAnnotations;
@@ -85,12 +91,16 @@ public final class RuntimeAnnotationPatcher {
             if (methodDiff != null) diffs.add(methodDiff);
             if (forceDeclaredAnnotations(method, desired)) {
                 methodsPatched++;
+            } else if (methodDiff != null) {
+                failures++;
             }
         }
         if (forceDeclaredAnnotations(type, classDesired)) {
             classPatched = 1;
+        } else if (classDiff != null) {
+            failures++;
         }
-        return new PatchReport(methodsPatched, classPatched, diffs);
+        return new PatchReport(methodsPatched, classPatched, failures, diffs);
     }
 
     /**

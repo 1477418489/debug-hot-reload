@@ -25,6 +25,7 @@ public final class HotReloadChineseMessages {
             case "CLASS_BATCH_SEND": return "发送类热更新";
             case "CLASS_BATCH_RESULT": return "类热更新结果";
             case "CLASS_BATCH_SKIPPED": return "类热更新已跳过";
+            case "CLASS_RESTART_REQUIRED": return "Java 类生命周期变更需要重启";
             case "CLASS_STRUCTURE_RELOAD": return "结构热更新";
             case "CLASS_STRUCTURE_FALLBACK": return "结构变更兜底热更新";
             case "IDEA_HOTSWAP_DISABLED": return "已禁用IDEA内置HotSwap";
@@ -45,18 +46,21 @@ public final class HotReloadChineseMessages {
             case "XML_SKIPPED": return "Mapper XML 变更已忽略";
             case "XML_READ_FAILED": return "读取 Mapper XML 失败";
             case "XML_QUEUE_REJECTED": return "Mapper XML 队列已满";
+            case "XML_RESTART_REQUIRED": return "Mapper XML 变更需要重启";
             case "XML_RESOURCE_AMBIGUOUS_PREFERRED": return "Mapper 资源多模块同名，已优先当前模块";
             case "XML_OUTPUT_COPY_MISSING_USE_SOURCE": return "输出目录暂无XML副本，已使用源文件内容热更新";
             case "CONFIG_RELOAD_SEND": return "发送配置文件热更新";
             case "CONFIG_RELOAD_RESULT": return "配置文件热更新结果";
             case "CONFIG_RELOAD_SKIPPED": return "配置文件热更新已跳过";
             case "CONFIG_READ_FAILED": return "读取配置文件失败";
+            case "CONFIG_RESTART_REQUIRED": return "配置文件生命周期变更需要重启";
             case "STATIC_RESOURCE_SYNCED": return "静态资源已同步到调试输出目录";
             case "STATIC_RESOURCE_REMOVED": return "静态资源已从调试输出目录删除";
             case "STATIC_SYNC_FAILED": return "静态资源同步失败";
             case "STATIC_RELOAD_SEND": return "发送静态资源缓存刷新";
             case "STATIC_RELOAD_RESULT": return "静态资源缓存刷新结果";
             case "STATIC_RELOAD_SKIPPED": return "静态资源热更新已跳过";
+            case "STATIC_RESTART_REQUIRED": return "静态资源变更需要重启";
             case "ENVIRONMENT_PROBE": return "运行环境探测";
             case "PROCESS_BIND_UNIDENTIFIED": return "未能识别调试进程";
             default: return event;
@@ -290,27 +294,46 @@ public final class HotReloadChineseMessages {
                 || lower.contains("attempted to add a method")
                 || lower.contains("class redefinition failed: attempted to add a method")
                 || lower.contains("虚拟机不支持的操作: add method")) {
-            return "标准JVM不支持直接新增方法；应走结构热更新(Generation)。若仍失败请重启Debug会话";
+            return "标准JVM不支持直接新增方法；E2增强引擎可就地处理，E3仅在可赋值子类能够表达且直接Spring Bean成功重建时支持，否则需重启Debug会话";
         }
         if (lower.contains("delete method not implemented")
                 || lower.contains("attempted to delete a method")
                 || lower.contains("class redefinition failed: attempted to delete a method")
                 || lower.contains("虚拟机不支持的操作: delete method")
                 || lower.contains("删除方法")) {
-            return "标准JVM不支持直接删除方法；应走结构热更新(Generation)。若仍失败请重启Debug会话";
+            return "标准JVM不支持直接删除方法；需由E2增强引擎就地处理，E3无法表达删除操作，否则需重启Debug会话";
         }
         if (lower.contains("add field not implemented")
-                || lower.contains("delete field not implemented")
-                || lower.contains("attempted to add a field")
+                || lower.contains("attempted to add a field")) {
+            return "标准JVM不支持直接新增字段；E2增强引擎可就地处理，E3仅在可赋值子类能够表达且直接Spring Bean成功重建时支持，否则需重启Debug会话";
+        }
+        if (lower.contains("delete field not implemented")
                 || lower.contains("attempted to delete a field")) {
-            return "标准JVM不支持直接增删字段；应走结构热更新(Generation)。若仍失败请重启Debug会话";
+            return "标准JVM不支持直接删除字段；需由E2增强引擎就地处理，E3无法表达删除操作，否则需重启Debug会话";
         }
-        if (lower.contains("class_structure_changed") || lower.contains("schema change")
+        if (lower.contains("generation cannot remove or change methods")) {
+            return "E3无法表达方法删除或签名变更；请使用E2增强引擎或重启Debug会话";
+        }
+        if (lower.contains("generation cannot remove or retype fields")) {
+            return "E3无法表达字段删除或类型变更；请使用E2增强引擎或重启Debug会话";
+        }
+        if (lower.contains("superclass change requires restart")
+                || lower.contains("removed interface requires restart")) {
+            return "E3无法表达父类变化或既有接口移除；请使用E2增强引擎或重启Debug会话";
+        }
+        if (lower.contains("conditionalbeanregistrationrequiresrestart")) {
+            return "组件包含@Profile/@Conditional条件，插件不会绕过Spring注册条件；请重启Debug会话由Spring重新判定";
+        }
+        if (lower.contains("dynamicbeanregistrationfailed")
+                || lower.contains("dynamicbeanbindfailed")) {
+            return "新Spring Bean未能完整注册或创建，为避免假成功请重启Debug会话";
+        }
+        if (lower.contains("class structure changed") || lower.contains("schema change")
                 || lower.contains("not implemented")) {
-            return "类结构已变化(字段/方法)，需要结构热更新或重启";
+            return "类结构已变化；E2增强引擎可处理其运行时接受的变更，E3仅支持可表达的新增成员和直接Spring Bean，否则需重启";
         }
-        if (lower.contains("class_ambiguous") || lower.contains("loadedcount=2")) {
-            return "同名类存在多代实例，已优先使用最新generation；若仍失败请重启Debug会话";
+        if (lower.contains("class ambiguous") || lower.contains("loadedcount=2")) {
+            return "同名类存在多个无法唯一确认的加载实例，已拒绝猜测目标；请消除类加载歧义或重启Debug会话";
         }
         return text;
     }
@@ -389,6 +412,18 @@ public final class HotReloadChineseMessages {
                 return "调试类路径中更早的条目遮蔽了该资源";
             case "file_event_too_large":
                 return "单次文件事件包含的文件节点过多";
+            case "mapper_lifecycle_change":
+                return "Mapper XML 已新增、删除、移动或重命名，运行时状态无法安全增量更新，请重启调试会话";
+            case "mapper_content_type_changed":
+                return "XML 文件已在 Mapper 与非 Mapper 类型之间切换，运行时语句无法安全增量增删，请重启调试会话";
+            case "class_source_lifecycle_change":
+                return "Java 源文件已删除、移动或重命名，JVM 无法卸载旧类，请重新构建并重启调试会话";
+            case "config_lifecycle_change":
+                return "配置文件已新增、删除、移动或重命名，Spring 属性源无法安全增量更新，请重启调试会话";
+            case "batch_exceeds_queue_capacity":
+                return "静态资源批次超过安全队列容量，请重新构建并重启调试会话";
+            case "queue_busy_after_retries":
+                return "静态资源生命周期批次重试后仍无法进入队列，请重新构建并重启调试会话";
             case "setting_changed_externally":
                 return "IDEA内置HotSwap设置已被外部修改";
             case "recovery_state_unavailable":

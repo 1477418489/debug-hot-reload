@@ -130,7 +130,7 @@ class ClassBatchReloaderTest {
                 || notLoadedLogs.contains("event=CLASS_BATCH_RESULT"), notLoadedLogs);
     }
 
-    @Test void recoversAddMethodSchemaRejectionViaGenerationFallback() throws Exception {
+    @Test void generationWithoutSpringBeanRequiresRestart() throws Exception {
         FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{AddMethodSample.class});
         fake.redefineFailure = new UnsupportedOperationException(
                 "class redefinition failed: attempted to add a method");
@@ -140,13 +140,11 @@ class ClassBatchReloaderTest {
                     addMethodSampleWithExtraMethod());
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
                     new ClassReloadRequest("r-add", "token", Collections.singletonList(update)));
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
-            assertNull(response.getErrorCode(), response.getMessage());
-            assertTrue(response.getMessage().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().contains("generation")
-                    || response.getItems().get(0).getDiagnostic().contains("fallback"),
-                    response.getItems().get(0).getDiagnostic() + " / " + response.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE, response.getErrorCode());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getItems().get(0).getStatus());
+            assertTrue(response.getItems().get(0).getDiagnostic().contains("springRebind=incomplete"),
+                    response.getItems().get(0).getDiagnostic());
             assertNotNull(HotReloadClassRegistry.get(AddMethodSample.class.getName()));
             Class<?> live = HotReloadClassRegistry.get(AddMethodSample.class.getName());
             assertNotNull(live);
@@ -163,18 +161,16 @@ class ClassBatchReloaderTest {
                 || logs.contains("generation"), logs);
     }
 
-    @Test void recoversSchemaRejectionViaGenerationFallback() throws Exception {
+    @Test void requiresRestartWhenFinalClassCannotUseAssignableGeneration() throws Exception {
         FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{Target.class});
         fake.redefineFailure = new UnsupportedOperationException(
                 "class redefinition failed: attempted to change the schema");
         AgentSessionLogger logger = logger("schema");
         try {
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(request(Target.class));
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
-            assertTrue(response.getItems().get(0).getDiagnostic().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().contains("generation")
-                    || response.getItems().get(0).getDiagnostic().contains("fallback")
-                    || response.getMessage().contains("structure"),
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.CLASS_STRUCTURE_CHANGED, response.getErrorCode());
+            assertTrue(response.getItems().get(0).getDiagnostic().contains("final_class_cannot_subclass"),
                     response.getItems().get(0).getDiagnostic());
         } finally {
             logger.close();
@@ -195,15 +191,15 @@ class ClassBatchReloaderTest {
         }
     }
 
-    @Test void recoversHierarchyRejectionViaGenerationWhenPossible() throws Exception {
+    @Test void hierarchyRejectionOnFinalClassRequiresRestart() throws Exception {
         FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{Target.class});
         fake.redefineFailure = new UnsupportedOperationException(
                 "class redefinition failed: attempted to change the superclass or interfaces");
         AgentSessionLogger logger = logger("hierarchy");
         try {
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(request(Target.class));
-            // Generation classloader can still define a replacement class for Spring bean swap.
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.CLASS_STRUCTURE_CHANGED, response.getErrorCode());
         } finally {
             logger.close();
             HotReloadClassRegistry.clear();
@@ -226,10 +222,10 @@ class ClassBatchReloaderTest {
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
                     new ClassReloadRequest("r-detect", "token", Collections.singletonList(
                             new ClassUpdate(AddMethodSample.class.getName(), addMethodSampleWithExtraMethod()))));
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE, response.getErrorCode());
             assertEquals(0, fake.redefineCalls.get(), "detected add method must skip redefineClasses");
-            assertTrue(response.getItems().get(0).getDiagnostic().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().contains("generation"),
+            assertTrue(response.getItems().get(0).getDiagnostic().contains("springRebind=incomplete"),
                     response.getItems().get(0).getDiagnostic());
         } finally {
             logger.close();
@@ -302,7 +298,7 @@ class ClassBatchReloaderTest {
     }
 
 
-    @Test void detectsDeletedMethodBeforeRedefineAndSkipsHotSpot() throws Exception {
+    @Test void detectedMethodDeletionRequiresRestartAndSkipsHotSpot() throws Exception {
         FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{DeleteMethodSample.class});
         fake.redefineFailure = new UnsupportedOperationException(
                 "虚拟机不支持的操作: delete method not implemented");
@@ -315,22 +311,22 @@ class ClassBatchReloaderTest {
                     deleteMethodSampleWithoutHello());
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
                     new ClassReloadRequest("r-del", "token", Collections.singletonList(update)));
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.CLASS_STRUCTURE_CHANGED, response.getErrorCode());
             assertEquals(0, fake.redefineCalls.get(), "structure delete must not call redefineClasses");
-            assertTrue(response.getItems().get(0).getDiagnostic().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().contains("generation"),
+            assertTrue(response.getItems().get(0).getDiagnostic()
+                            .contains("generation_cannot_remove_or_change_methods"),
                     response.getItems().get(0).getDiagnostic());
-            assertNotNull(HotReloadClassRegistry.get(DeleteMethodSample.class.getName()));
+            assertNull(HotReloadClassRegistry.get(DeleteMethodSample.class.getName()));
         } finally {
             logger.close();
             HotReloadClassRegistry.clear();
         }
         String logs = readLogs("delete-method.log");
-        assertTrue(logs.contains("CLASS_STRUCTURE_RELOAD") || logs.contains("structure"), logs);
-        assertFalse(logs.contains("CLASS_STRUCTURE_FALLBACK") && logs.contains("FAILED"), logs);
+        assertTrue(logs.contains("CLASS_STRUCTURE_RELOAD"), logs);
     }
 
-    @Test void detectsDeletedFieldBeforeRedefineAndSkipsHotSpot() throws Exception {
+    @Test void detectedFieldDeletionRequiresRestartAndSkipsHotSpot() throws Exception {
         FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{DeleteFieldSample.class});
         fake.redefineFailure = new UnsupportedOperationException("delete field not implemented");
         AgentSessionLogger logger = logger("delete-field");
@@ -339,10 +335,11 @@ class ClassBatchReloaderTest {
                     deleteFieldSampleWithoutField());
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
                     new ClassReloadRequest("r-delf", "token", Collections.singletonList(update)));
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.CLASS_STRUCTURE_CHANGED, response.getErrorCode());
             assertEquals(0, fake.redefineCalls.get());
-            assertTrue(response.getItems().get(0).getDiagnostic().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().contains("generation"),
+            assertTrue(response.getItems().get(0).getDiagnostic()
+                            .contains("generation_cannot_remove_or_retype_fields"),
                     response.getItems().get(0).getDiagnostic());
         } finally {
             logger.close();
@@ -358,7 +355,8 @@ class ClassBatchReloaderTest {
             ClassUpdate first = new ClassUpdate(AddMethodSample.class.getName(), addMethodSampleWithExtraMethod());
             ReloadResponse r1 = new ClassBatchReloader(fake.proxy(), logger).reload(
                     new ClassReloadRequest("r1", "token", Collections.singletonList(first)));
-            assertEquals(OperationStatus.SUCCESS, r1.getStatus(), r1.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, r1.getStatus(), r1.getMessage());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE, r1.getErrorCode());
             Class<?> gen1 = HotReloadClassRegistry.get(AddMethodSample.class.getName());
             assertNotNull(gen1);
 
@@ -370,7 +368,8 @@ class ClassBatchReloaderTest {
                     addMethodSampleWithExtraMethodAndField());
             ReloadResponse r2 = new ClassBatchReloader(ambiguous.proxy(), logger).reload(
                     new ClassReloadRequest("r2", "token", Collections.singletonList(second)));
-            assertEquals(OperationStatus.SUCCESS, r2.getStatus(), r2.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, r2.getStatus(), r2.getMessage());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE, r2.getErrorCode());
             assertNotEquals(ReloadErrorCode.CLASS_AMBIGUOUS, r2.getErrorCode(), r2.getMessage());
             Class<?> gen2 = HotReloadClassRegistry.get(AddMethodSample.class.getName());
             assertNotNull(gen2);
@@ -382,7 +381,7 @@ class ClassBatchReloaderTest {
     }
 
 
-    @Test void recoversChineseDeleteMethodWhenAnalysisMissedAndRedefineRejected() throws Exception {
+    @Test void chineseDeleteMethodOnFinalClassRequiresRestart() throws Exception {
         // Compatible shape so analysis is not STRUCTURE; redefine throws CN HotSpot message.
         FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{Target.class});
         fake.redefineFailure = new UnsupportedOperationException(
@@ -390,13 +389,10 @@ class ClassBatchReloaderTest {
         AgentSessionLogger logger = logger("cn-delete-fallback");
         try {
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(request(Target.class));
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
-            assertTrue(response.getItems().get(0).getDiagnostic().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().contains("generation")
-                    || response.getItems().get(0).getDiagnostic().contains("fallback"),
-                    response.getItems().get(0).getDiagnostic());
-            // redefine attempted once, then recovered via generation
-            assertEquals(1, fake.redefineCalls.get());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.CLASS_STRUCTURE_CHANGED, response.getErrorCode());
+            assertEquals(2, fake.redefineCalls.get(),
+                    "a rejected batch is retried once as an isolated class");
         } finally {
             logger.close();
             HotReloadClassRegistry.clear();
@@ -419,7 +415,8 @@ class ClassBatchReloaderTest {
             assertTrue(analysis.isStructureChanged());
             ReloadResponse response = new ClassBatchReloader(fake2.proxy(), logger).reload(
                     new ClassReloadRequest("r-addf", "token", Collections.singletonList(update)));
-            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE, response.getErrorCode());
             assertEquals(0, fake2.redefineCalls.get(), "add field structure must skip redefine");
         } finally {
             logger.close();
@@ -427,18 +424,145 @@ class ClassBatchReloaderTest {
         }
     }
 
-    @Test void englishDeleteMethodMessageRecoveredWhenRedefineRejected() throws Exception {
+    @Test void englishDeleteMethodOnFinalClassRequiresRestart() throws Exception {
         FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{Target.class});
         fake.redefineFailure = new UnsupportedOperationException(
                 "class redefinition failed: attempted to delete a method");
         AgentSessionLogger logger = logger("en-delete-fallback");
         try {
             ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(request(Target.class));
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.CLASS_STRUCTURE_CHANGED, response.getErrorCode());
+        } finally {
+            logger.close();
+            HotReloadClassRegistry.clear();
+        }
+    }
+
+    @Test void mixedBatchRebindsAppliedStructureWhenBodyRedefineFails() throws Exception {
+        FakeInstrumentation fake = new FakeInstrumentation(true,
+                new Class<?>[]{AddMethodSample.class, Target.class});
+        fake.redefineFailure = new InternalError("body redefine failed");
+        AgentSessionLogger logger = logger("mixed-partial");
+        try {
+            ClassReloadRequest request = new ClassReloadRequest("mixed", "token", Arrays.asList(
+                    new ClassUpdate(AddMethodSample.class.getName(), addMethodSampleWithExtraMethod()),
+                    update(Target.class)));
+            ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(request);
+
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE, response.getErrorCode());
+            assertEquals(2, response.getItems().size());
+            assertEquals(AddMethodSample.class.getName(), response.getItems().get(0).getItemId());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getItems().get(0).getStatus());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE,
+                    response.getItems().get(0).getErrorCode());
+            assertEquals(Target.class.getName(), response.getItems().get(1).getItemId());
+            assertEquals(OperationStatus.FAILED, response.getItems().get(1).getStatus());
+            assertEquals(1, fake.definitions.get().length);
+            assertNotNull(HotReloadClassRegistry.get(AddMethodSample.class.getName()));
+        } finally {
+            logger.close();
+            HotReloadClassRegistry.clear();
+        }
+    }
+
+    @Test void isolatesClassesAfterAtomicBatchSchemaRejection() throws Exception {
+        FakeInstrumentation fake = new FakeInstrumentation(true,
+                new Class<?>[]{Target.class, SecondTarget.class});
+        fake.batchRedefineFailure = new UnsupportedOperationException(
+                "class redefinition failed: attempted to add a method");
+        AgentSessionLogger logger = logger("isolated-batch-retry");
+        try {
+            ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
+                    new ClassReloadRequest("isolated", "token", Arrays.asList(
+                            update(Target.class), update(SecondTarget.class))));
+
             assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
-            assertTrue(response.getItems().get(0).getDiagnostic().toLowerCase().contains("structure")
-                    || response.getItems().get(0).getDiagnostic().toLowerCase().contains("generation")
-                    || response.getItems().get(0).getDiagnostic().toLowerCase().contains("fallback"),
-                    response.getItems().get(0).getDiagnostic());
+            assertEquals(3, fake.redefineCalls.get(),
+                    "one rejected batch must be followed by one redefine per class");
+            assertEquals(OperationStatus.SUCCESS, response.getItems().get(0).getStatus());
+            assertEquals(OperationStatus.SUCCESS, response.getItems().get(1).getStatus());
+            assertSame(Target.class, HotReloadClassRegistry.get(Target.class.getName()));
+            assertSame(SecondTarget.class, HotReloadClassRegistry.get(SecondTarget.class.getName()));
+        } finally {
+            logger.close();
+            HotReloadClassRegistry.clear();
+        }
+    }
+
+    @Test void generationFallbackAfterJvmRejectionStillRequiresSpringBinding() throws Exception {
+        FakeInstrumentation fake = new FakeInstrumentation(true, new Class<?>[]{AddMethodSample.class});
+        fake.redefineFailure = new UnsupportedOperationException(
+                "class redefinition failed: attempted to change the schema");
+        AgentSessionLogger logger = logger("fallback-generation-binding");
+        try {
+            ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
+                    new ClassReloadRequest("r-fallback", "token", Collections.singletonList(
+                            new ClassUpdate(AddMethodSample.class.getName(), addMethodSampleSameShape()))));
+
+            assertEquals(2, fake.redefineCalls.get(),
+                    "the initial batch and isolated recovery both attempt redefine");
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus(), response.getMessage());
+            assertEquals(ReloadErrorCode.SPRING_REBIND_INCOMPLETE, response.getErrorCode());
+            assertNotNull(HotReloadClassRegistry.get(AddMethodSample.class.getName()));
+        } finally {
+            logger.close();
+            HotReloadClassRegistry.clear();
+        }
+    }
+
+    @Test void resolveLoadedTargetRejectsMultipleUnregisteredGenerations() {
+        Class<?> original = AddMethodSample.class;
+        byte[] bytecode = addMethodSampleWithExtraMethod();
+        Class<?> first = new GenerationClassLoader(
+                original.getClassLoader(), original.getName(), bytecode).defineTarget();
+        Class<?> second = new GenerationClassLoader(
+                original.getClassLoader(), original.getName(), bytecode).defineTarget();
+
+        assertNull(ClassBatchReloader.resolveLoadedTarget(original.getName(),
+                Arrays.asList(original, first, second), new LinkedHashSet<String>()));
+    }
+
+    @Test void ambiguousLoadedTargetsRequireRestartInsteadOfGuessing() throws Exception {
+        Class<?> original = AddMethodSample.class;
+        byte[] bytecode = addMethodSampleSameShape();
+        Class<?> first = new GenerationClassLoader(
+                original.getClassLoader(), original.getName(), bytecode).defineTarget();
+        Class<?> second = new GenerationClassLoader(
+                original.getClassLoader(), original.getName(), bytecode).defineTarget();
+        FakeInstrumentation fake = new FakeInstrumentation(
+                true, new Class<?>[]{original, first, second});
+        AgentSessionLogger logger = logger("ambiguous-loaded-targets");
+        try {
+            ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
+                    new ClassReloadRequest("ambiguous", "token", Collections.singletonList(
+                            new ClassUpdate(original.getName(), bytecode))));
+
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getStatus());
+            assertEquals(ReloadErrorCode.CLASS_AMBIGUOUS, response.getErrorCode());
+            assertEquals(OperationStatus.RESTART_REQUIRED, response.getItems().get(0).getStatus());
+            assertEquals(0, fake.redefineCalls.get());
+        } finally {
+            logger.close();
+            HotReloadClassRegistry.clear();
+        }
+    }
+
+    @Test void definesNewClassInTheApplicationLoader() throws Exception {
+        String binaryName = "dev.hotreload.agent.classes.BatchLookupDefinedSample";
+        FakeInstrumentation fake = new FakeInstrumentation(true,
+                new Class<?>[]{ClassBatchReloaderTest.class});
+        AgentSessionLogger logger = logger("define-lookup");
+        try {
+            ReloadResponse response = new ClassBatchReloader(fake.proxy(), logger).reload(
+                    new ClassReloadRequest("new", "token", Collections.singletonList(
+                            new ClassUpdate(binaryName, namedEmptyClass(binaryName)))));
+
+            assertEquals(OperationStatus.SUCCESS, response.getStatus(), response.getMessage());
+            Class<?> defined = HotReloadClassRegistry.get(binaryName);
+            assertNotNull(defined);
+            assertSame(ClassBatchReloaderTest.class.getClassLoader(), defined.getClassLoader());
         } finally {
             logger.close();
             HotReloadClassRegistry.clear();
@@ -456,6 +580,21 @@ class ClassBatchReloaderTest {
 
     private static byte[] bytes(Class<?> type) {
         String internalName = type.getName().replace('.', '/');
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, internalName, null, "java/lang/Object", null);
+        MethodVisitor constructor = writer.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+        constructor.visitCode();
+        constructor.visitVarInsn(Opcodes.ALOAD, 0);
+        constructor.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        constructor.visitInsn(Opcodes.RETURN);
+        constructor.visitMaxs(1, 1);
+        constructor.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] namedEmptyClass(String binaryName) {
+        String internalName = binaryName.replace('.', '/');
         ClassWriter writer = new ClassWriter(0);
         writer.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, internalName, null, "java/lang/Object", null);
         MethodVisitor constructor = writer.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
@@ -538,6 +677,29 @@ class ClassBatchReloaderTest {
         writer.visitEnd();
         return writer.toByteArray();
     }
+
+    private static byte[] addMethodSampleSameShape() {
+        String internal = Type.getInternalName(AddMethodSample.class);
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, internal, null, "java/lang/Object", null);
+        MethodVisitor constructor = writer.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+        constructor.visitCode();
+        constructor.visitVarInsn(Opcodes.ALOAD, 0);
+        constructor.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        constructor.visitInsn(Opcodes.RETURN);
+        constructor.visitMaxs(1, 1);
+        constructor.visitEnd();
+        MethodVisitor hello = writer.visitMethod(
+                Opcodes.ACC_PUBLIC, "hello", "()Ljava/lang/String;", null, null);
+        hello.visitCode();
+        hello.visitLdcInsn("updated");
+        hello.visitInsn(Opcodes.ARETURN);
+        hello.visitMaxs(1, 1);
+        hello.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
     private static byte[] addMethodSampleWithExtraMethod() {
         String internal = Type.getInternalName(AddMethodSample.class);
         ClassWriter writer = new ClassWriter(0);
@@ -589,6 +751,7 @@ class ClassBatchReloaderTest {
         private final AtomicReference<ClassDefinition[]> definitions = new AtomicReference<ClassDefinition[]>();
         private volatile boolean modifiable = true;
         private volatile Throwable redefineFailure;
+        private volatile Throwable batchRedefineFailure;
 
         private FakeInstrumentation(boolean supported, Class<?>[] loaded) {
             this.supported = supported;
@@ -607,6 +770,9 @@ class ClassBatchReloaderTest {
                         if ("redefineClasses".equals(method.getName())) {
                             redefineCalls.incrementAndGet();
                             definitions.set((ClassDefinition[]) arguments[0]);
+                            if (batchRedefineFailure != null && definitions.get().length > 1) {
+                                throw batchRedefineFailure;
+                            }
                             if (redefineFailure != null) throw redefineFailure;
                             return null;
                         }

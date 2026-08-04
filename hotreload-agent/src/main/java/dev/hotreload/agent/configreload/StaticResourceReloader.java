@@ -46,28 +46,38 @@ public final class StaticResourceReloader {
             }
 
             int cleared = 0;
+            int failed = 0;
             List<ReloadItemResult> items = new ArrayList<ReloadItemResult>();
 
             for (int i = 0; i < contexts.size(); i++) {
                 Object context = contexts.get(i);
-                boolean cacheClearedOk = clearResourceCache(context);
+                CacheClearStatus cacheStatus = clearResourceCache(context);
 
-                if (cacheClearedOk) cleared++;
+                if (cacheStatus == CacheClearStatus.CLEARED) cleared++;
+                if (cacheStatus == CacheClearStatus.FAILED) failed++;
 
-                String detail = "cache=" + (cacheClearedOk ? "cleared" : "unavailable");
+                OperationStatus itemStatus = cacheStatus == CacheClearStatus.CLEARED
+                        ? OperationStatus.SUCCESS
+                        : cacheStatus == CacheClearStatus.FAILED
+                        ? OperationStatus.RESTART_REQUIRED : OperationStatus.SKIPPED;
+                ReloadErrorCode itemCode = cacheStatus == CacheClearStatus.FAILED
+                        ? ReloadErrorCode.INTERNAL_ERROR : null;
+                String detail = "cache=" + cacheStatus.name().toLowerCase(java.util.Locale.ROOT);
                 items.add(new ReloadItemResult(path + "@ctx" + i,
-                        cacheClearedOk ? OperationStatus.SUCCESS : OperationStatus.SKIPPED,
-                        null, cacheClearedOk ? "SUCCESS" : "SKIPPED", detail));
+                        itemStatus, itemCode, itemStatus.name(), detail));
             }
 
-            OperationStatus status = cleared > 0 ? OperationStatus.SUCCESS : OperationStatus.SKIPPED;
-            logger.log(Level.INFO, "STATIC_RELOAD_RESULT", fields(
+            OperationStatus status = failed > 0 ? OperationStatus.RESTART_REQUIRED
+                    : cleared > 0 ? OperationStatus.SUCCESS : OperationStatus.SKIPPED;
+            ReloadErrorCode code = failed > 0 ? ReloadErrorCode.INTERNAL_ERROR : null;
+            logger.log(failed > 0 ? Level.WARNING : Level.INFO, "STATIC_RELOAD_RESULT", fields(
                     "requestId", request.getRequestId(),
                     "resourceId", path,
                     "resultCode", status.name(),
                     "detail", "contexts=" + contexts.size() + ",cleared=" + cleared
+                            + ",failed=" + failed
                             + ",ms=" + ((System.nanoTime() - started) / 1_000_000L)));
-            return new ReloadResponse(request.getRequestId(), status, null, status.name(), items);
+            return new ReloadResponse(request.getRequestId(), status, code, status.name(), items);
 
         } catch (Throwable failure) {
             logger.log(Level.WARNING, "STATIC_RELOAD_RESULT", fields(
@@ -81,10 +91,10 @@ public final class StaticResourceReloader {
     }
 
     /** Clears only Spring MVC components that directly own static-resource caches. */
-    private boolean clearResourceCache(Object context) {
+    private CacheClearStatus clearResourceCache(Object context) {
         try {
             ClassLoader loader = context.getClass().getClassLoader();
-            boolean cleared = false;
+            CacheClearStatus status = CacheClearStatus.UNAVAILABLE;
             Set<Object> handlers = Collections.newSetFromMap(
                     new IdentityHashMap<Object, Boolean>());
             Class<?> providerType = loadClassSafe(loader,
@@ -100,8 +110,8 @@ public final class StaticResourceReloader {
                     urlProvider = null;
                 }
             }
-            cleared |= clearCacheComponent(urlProvider);
-            addProviderHandlers(urlProvider, handlers);
+            status = combine(status, clearCacheComponent(urlProvider));
+            status = combine(status, addProviderHandlers(urlProvider, handlers));
 
             // Standard Spring MVC handlers live in ResourceUrlProvider.handlerMap and are not
             // necessarily standalone beans. Exact-type discovery is only a compatibility fallback.
@@ -124,48 +134,100 @@ public final class StaticResourceReloader {
             }
 
             for (Object handler : handlers) {
-                cleared |= clearResourceHandlerCaches(handler);
+                status = combine(status, clearResourceHandlerCachesStatus(handler));
             }
 
-            return cleared;
+            return status;
         } catch (Throwable failure) {
             logger.log(Level.FINE, "RESOURCE_CACHE_CLEAR_FAILED", fields(
                     "reason", failure.getClass().getSimpleName(),
                     "message", failure.getMessage() != null ? failure.getMessage() : ""));
-            return false;
+            return CacheClearStatus.FAILED;
         }
     }
 
-    private static void addProviderHandlers(Object provider, Set<Object> handlers) {
-        if (provider == null || handlers == null) return;
-        Object handlerMap = invoke(provider, "getHandlerMap");
-        if (!(handlerMap instanceof Map)) return;
-        for (Object handler : ((Map<?, ?>) handlerMap).values()) {
-            if (handler != null) handlers.add(handler);
+    private static CacheClearStatus addProviderHandlers(Object provider, Set<Object> handlers) {
+        if (provider == null || handlers == null) return CacheClearStatus.UNAVAILABLE;
+        Method getter = findMethod(provider.getClass(), "getHandlerMap");
+        if (getter == null) return CacheClearStatus.UNAVAILABLE;
+        try {
+            getter.setAccessible(true);
+            Object handlerMap = getter.invoke(provider);
+            if (!(handlerMap instanceof Map)) return CacheClearStatus.UNAVAILABLE;
+            for (Object handler : ((Map<?, ?>) handlerMap).values()) {
+                if (handler != null) handlers.add(handler);
+            }
+            return CacheClearStatus.UNAVAILABLE;
+        } catch (Throwable failure) {
+            return CacheClearStatus.FAILED;
         }
     }
 
     static boolean clearResourceHandlerCaches(Object handler) {
-        if (handler == null) return false;
-        boolean cleared = clearCacheComponents(invoke(handler, "getResourceResolvers"));
-        cleared |= clearCacheComponents(invoke(handler, "getResourceTransformers"));
-        return cleared;
+        return clearResourceHandlerCachesStatus(handler) == CacheClearStatus.CLEARED;
     }
 
-    private static boolean clearCacheComponents(Object components) {
-        if (!(components instanceof Iterable)) return false;
-        boolean cleared = false;
-        for (Object component : (Iterable<?>) components) {
-            cleared |= clearCacheComponent(component);
+    private static CacheClearStatus clearResourceHandlerCachesStatus(Object handler) {
+        if (handler == null) return CacheClearStatus.UNAVAILABLE;
+        CacheClearStatus status = clearCacheComponentsFrom(handler, "getResourceResolvers");
+        return combine(status, clearCacheComponentsFrom(handler, "getResourceTransformers"));
+    }
+
+    private static CacheClearStatus clearCacheComponentsFrom(Object owner, String getterName) {
+        Method getter = findMethod(owner.getClass(), getterName);
+        if (getter == null) return CacheClearStatus.UNAVAILABLE;
+        try {
+            getter.setAccessible(true);
+            return clearCacheComponents(getter.invoke(owner));
+        } catch (Throwable failure) {
+            return CacheClearStatus.FAILED;
         }
-        return cleared;
     }
 
-    private static boolean clearCacheComponent(Object component) {
-        if (component == null) return false;
-        if (invokeIfPresent(component, "clearCache")) return true;
-        Object cache = invoke(component, "getCache");
-        return cache != null && invokeIfPresent(cache, "clear");
+    private static CacheClearStatus clearCacheComponents(Object components) {
+        if (!(components instanceof Iterable)) return CacheClearStatus.UNAVAILABLE;
+        CacheClearStatus status = CacheClearStatus.UNAVAILABLE;
+        for (Object component : (Iterable<?>) components) {
+            status = combine(status, clearCacheComponent(component));
+        }
+        return status;
+    }
+
+    private static CacheClearStatus clearCacheComponent(Object component) {
+        if (component == null) return CacheClearStatus.UNAVAILABLE;
+        Method clearCache = findMethod(component.getClass(), "clearCache");
+        if (clearCache != null) return invokeClear(component, clearCache);
+        Method getCache = findMethod(component.getClass(), "getCache");
+        if (getCache == null) return CacheClearStatus.UNAVAILABLE;
+        try {
+            getCache.setAccessible(true);
+            Object cache = getCache.invoke(component);
+            if (cache == null) return CacheClearStatus.UNAVAILABLE;
+            Method clear = findMethod(cache.getClass(), "clear");
+            return clear == null ? CacheClearStatus.FAILED : invokeClear(cache, clear);
+        } catch (Throwable failure) {
+            return CacheClearStatus.FAILED;
+        }
+    }
+
+    private static CacheClearStatus invokeClear(Object target, Method method) {
+        try {
+            method.setAccessible(true);
+            method.invoke(target);
+            return CacheClearStatus.CLEARED;
+        } catch (Throwable failure) {
+            return CacheClearStatus.FAILED;
+        }
+    }
+
+    private static CacheClearStatus combine(CacheClearStatus left, CacheClearStatus right) {
+        if (left == CacheClearStatus.FAILED || right == CacheClearStatus.FAILED) {
+            return CacheClearStatus.FAILED;
+        }
+        if (left == CacheClearStatus.CLEARED || right == CacheClearStatus.CLEARED) {
+            return CacheClearStatus.CLEARED;
+        }
+        return CacheClearStatus.UNAVAILABLE;
     }
 
     private Object getBeanSafe(Object context, String beanName) {
@@ -210,18 +272,6 @@ public final class StaticResourceReloader {
         }
     }
 
-    private static boolean invokeIfPresent(Object target, String method) {
-        Method candidate = findMethod(target.getClass(), method);
-        if (candidate == null) return false;
-        try {
-            candidate.setAccessible(true);
-            candidate.invoke(target);
-            return true;
-        } catch (Throwable ignored) {
-            return false;
-        }
-    }
-
     private static Method findMethod(Class<?> type, String name) {
         return findMethod(type, name, new Class<?>[0]);
     }
@@ -248,5 +298,11 @@ public final class StaticResourceReloader {
             for (int i = 0; i + 1 < kv.length; i += 2) map.put(kv[i], kv[i + 1]);
         }
         return map;
+    }
+
+    private enum CacheClearStatus {
+        CLEARED,
+        UNAVAILABLE,
+        FAILED
     }
 }

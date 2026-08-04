@@ -10,8 +10,10 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -29,6 +31,16 @@ public final class ClassCompilationListener implements CompilationStatusListener
         String activeDebugLaunchForOutput(Path outputRoot);
         default String activeDebugLaunchForClass(Path outputRoot, String relativePath) {
             return activeDebugLaunchForOutput(outputRoot);
+        }
+        default List<String> activeDebugLaunchesForOutput(Path outputRoot) {
+            String launchId = activeDebugLaunchForOutput(outputRoot);
+            return launchId == null ? Collections.<String>emptyList()
+                    : Collections.singletonList(launchId);
+        }
+        default List<String> activeDebugLaunchesForClass(Path outputRoot, String relativePath) {
+            String launchId = activeDebugLaunchForClass(outputRoot, relativePath);
+            return launchId == null ? Collections.<String>emptyList()
+                    : Collections.singletonList(launchId);
         }
         void recordWarning(String event, String reason);
         void reloadClasses(String launchId, List<ClassUpdate> updates);
@@ -53,6 +65,14 @@ public final class ClassCompilationListener implements CompilationStatusListener
                 return sessions.activeDebugLaunchForClass(outputRoot, relativePath);
             }
 
+            @Override public List<String> activeDebugLaunchesForOutput(Path outputRoot) {
+                return sessions.activeDebugLaunchesForOutput(outputRoot);
+            }
+
+            @Override public List<String> activeDebugLaunchesForClass(Path outputRoot, String relativePath) {
+                return sessions.activeDebugLaunchesForClass(outputRoot, relativePath);
+            }
+
             @Override public void recordWarning(String event, String reason) {
                 sessions.recordWarning(event, reason);
             }
@@ -71,15 +91,15 @@ public final class ClassCompilationListener implements CompilationStatusListener
     @Override public void fileGenerated(String outputRoot, String relativePath) {
         if (!sessions.isJavaReloadEnabled()) return;
         Path root;
-        String launchId;
+        List<String> launchIds;
         try {
             root = toPath(outputRoot);
-            launchId = sessions.activeDebugLaunchForClass(root, relativePath);
+            launchIds = sessions.activeDebugLaunchesForClass(root, relativePath);
         } catch (RuntimeException failure) {
             sessions.recordWarning("CLASS_OUTPUT_REJECTED", failure.getClass().getSimpleName());
             return;
         }
-        if (launchId == null) return;
+        if (launchIds == null || launchIds.isEmpty()) return;
 
         String failureReason = null;
         boolean batchLimitReached = false;
@@ -96,12 +116,16 @@ public final class ClassCompilationListener implements CompilationStatusListener
             }
             if (state != null) {
                 try {
-                    ClassFileBatchCollector collector = state.collectorFor(launchId);
-                    if (collector == null) {
-                        state.routingRejected = true;
-                        failureReason = "concurrent_compile_launch_limit";
-                    } else {
-                        collector.record(root, relativePath);
+                    for (String launchId : new LinkedHashSet<String>(launchIds)) {
+                        if (launchId == null || launchId.isEmpty()) continue;
+                        ClassFileBatchCollector collector = state.collectorFor(launchId);
+                        if (collector == null) {
+                            state.routingRejected = true;
+                            failureReason = "concurrent_compile_launch_limit";
+                            break;
+                        } else {
+                            collector.record(root, relativePath);
+                        }
                     }
                 } catch (RuntimeException failure) {
                     state.routingRejected = true;

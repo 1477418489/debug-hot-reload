@@ -200,31 +200,56 @@ class StructuralClassReloaderTest {
     }
 
     @Test
-    void skipsRedefineWhenDeleteMethodDetected() {
+    void deletedMethodRequiresRestartInsteadOfAnInexactGeneration() {
         final AtomicInteger redefineCalls = new AtomicInteger();
         Instrumentation instrumentation = countingInstrumentation(redefineCalls,
                 new UnsupportedOperationException("delete method not implemented"));
         StructuralClassReloader reloader = new StructuralClassReloader(instrumentation);
         StructuralClassReloader.Result result =
                 reloader.reloadExisting(SampleWithFieldAndMethods.class, sampleWithoutHelloMethod(), false);
-        assertTrue(result.success, result.detail);
-        assertEquals("generation", result.mode, result.detail);
+        assertFalse(result.success, result.detail);
+        assertEquals("failed", result.mode, result.detail);
+        assertTrue(result.detail.contains("generation_cannot_remove_or_change_methods"), result.detail);
         assertEquals(0, redefineCalls.get(), "detected delete method must not call redefineClasses");
-        assertTrue(result.detail.contains("detected_structure") || result.detail.contains("known_structure"),
-                result.detail);
     }
 
     @Test
-    void skipsRedefineWhenDeleteFieldDetected() {
+    void deletedFieldRequiresRestartInsteadOfAnInexactGeneration() {
         final AtomicInteger redefineCalls = new AtomicInteger();
         Instrumentation instrumentation = countingInstrumentation(redefineCalls,
                 new UnsupportedOperationException("delete field not implemented"));
         StructuralClassReloader reloader = new StructuralClassReloader(instrumentation);
         StructuralClassReloader.Result result =
                 reloader.reloadExisting(SampleWithFieldAndMethods.class, sampleWithoutField(), false);
-        assertTrue(result.success, result.detail);
-        assertEquals("generation", result.mode, result.detail);
+        assertFalse(result.success, result.detail);
+        assertEquals("failed", result.mode, result.detail);
+        assertTrue(result.detail.contains("generation_cannot_remove_or_retype_fields"), result.detail);
         assertEquals(0, redefineCalls.get(), "detected delete field must not call redefineClasses");
+    }
+
+    @Test
+    void changedSuperclassRequiresRestartInsteadOfGeneration() {
+        StructuralClassReloader reloader = new StructuralClassReloader(
+                failingInstrumentation(new UnsupportedOperationException("superclass change")));
+        StructuralClassReloader.Result result = reloader.reloadExisting(
+                Sample.class, sampleWithHierarchy(Sample.class, "java/util/ArrayList", null), true);
+
+        assertFalse(result.success, result.detail);
+        assertEquals("failed", result.mode);
+        assertTrue(result.detail.contains("superclass_change_requires_restart"), result.detail);
+    }
+
+    @Test
+    void removedInterfaceRequiresRestartInsteadOfGeneration() {
+        StructuralClassReloader reloader = new StructuralClassReloader(
+                failingInstrumentation(new UnsupportedOperationException("interface change")));
+        StructuralClassReloader.Result result = reloader.reloadExisting(
+                InterfaceSample.class,
+                sampleWithHierarchy(InterfaceSample.class, "java/lang/Object", new String[0]), true);
+
+        assertFalse(result.success, result.detail);
+        assertEquals("failed", result.mode);
+        assertTrue(result.detail.contains("removed_interface_requires_restart"), result.detail);
     }
 
     @Test
@@ -256,6 +281,20 @@ class StructuralClassReloaderTest {
                 new UnsupportedOperationException("虚拟机不支持的操作: delete method not implemented")));
     }
 
+    @Test
+    void finalClassStructureChangeNeverReportsUnassignableSuccess() {
+        StructuralClassReloader reloader = new StructuralClassReloader(
+                failingInstrumentation(new UnsupportedOperationException("add method not implemented")));
+        StructuralClassReloader.Result result = reloader.reloadExisting(
+                FinalSample.class, sampleShape(FinalSample.class, false, true, true), true);
+
+        assertFalse(result.success, result.detail);
+        assertEquals("failed", result.mode);
+        assertSame(FinalSample.class, result.liveClass);
+        assertTrue(result.detail.contains("final_class_cannot_subclass"), result.detail);
+        assertNull(HotReloadClassRegistry.get(FinalSample.class.getName()));
+    }
+
     public static class Sample {
         public String hello() { return "ok"; }
     }
@@ -264,6 +303,16 @@ class StructuralClassReloaderTest {
         private int value;
         public String hello() { return "ok"; }
         public int value() { return value; }
+    }
+
+    interface Marker { }
+
+    public static class InterfaceSample implements Marker {
+        public String hello() { return "ok"; }
+    }
+
+    public static final class FinalSample {
+        public String hello() { return "ok"; }
     }
 
     private static Instrumentation failingInstrumentation(final Throwable failure) {
@@ -351,6 +400,28 @@ class StructuralClassReloaderTest {
         value.visitInsn(Opcodes.IRETURN);
         value.visitMaxs(1, 1);
         value.visitEnd();
+        cw.visitEnd();
+        return cw.toByteArray();
+    }
+
+    private static byte[] sampleWithHierarchy(Class<?> type, String superInternal, String[] interfaces) {
+        String internal = Type.getInternalName(type);
+        ClassWriter cw = new ClassWriter(0);
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, internal, null, superInternal, interfaces);
+        MethodVisitor init = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+        init.visitCode();
+        init.visitVarInsn(Opcodes.ALOAD, 0);
+        init.visitMethodInsn(Opcodes.INVOKESPECIAL, superInternal, "<init>", "()V", false);
+        init.visitInsn(Opcodes.RETURN);
+        init.visitMaxs(1, 1);
+        init.visitEnd();
+        MethodVisitor hello = cw.visitMethod(
+                Opcodes.ACC_PUBLIC, "hello", "()Ljava/lang/String;", null, null);
+        hello.visitCode();
+        hello.visitLdcInsn("ok");
+        hello.visitInsn(Opcodes.ARETURN);
+        hello.visitMaxs(1, 1);
+        hello.visitEnd();
         cw.visitEnd();
         return cw.toByteArray();
     }
