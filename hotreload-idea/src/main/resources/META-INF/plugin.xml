@@ -1,0 +1,88 @@
+<idea-plugin>
+  <id>dev.hotreload.idea</id>
+  <name>Debug Hot Reload</name>
+  <vendor email="support@example.invalid">Debug Hot Reload</vendor>
+  <description><![CDATA[
+    <h2>Debug Hot Reload —— IDEA Debug 模式下的 Java/Spring/MyBatis 热重载</h2>
+    <p>仅在 IDEA <b>Debug</b> 启动时注入 Agent，支持开发期热更新，不替代生产部署。</p>
+
+    <h3>核心特性</h3>
+    <ul>
+      <li><b>增强引擎支持</b>：自动检测 DCEVM/JetBrains Runtime，结构变更保持类身份，存活实例即时生效</li>
+      <li><b>Spring Bean 智能重载</b>：注解/字段变更时原地补注入，仅代理过期时重建，避免全量销毁</li>
+      <li><b>方法体 & 注解热更新</b>：修改方法实现、增删 @Transactional/@RequestMapping 等注解即时生效</li>
+      <li><b>结构变更支持</b>：新增/删除方法、字段，自动降级 Generation 路径或增强引擎原生支持</li>
+      <li><b>MyBatis Mapper XML</b>：修改 SQL 后自动清理缓存，无需重启</li>
+      <li><b>配置文件热更新</b>：application.properties / yml 修改后刷新到 Spring Environment</li>
+      <li><b>静态资源热更新</b>：HTML/CSS/JS/图片/字体安全同步到当前 Debug 类路径并刷新 Spring MVC 资源缓存</li>
+      <li><b>精细作用范围</b>：支持全局默认、项目覆盖、功能开关及运行配置排除</li>
+    </ul>
+
+    <h3>技术亮点</h3>
+    <ul>
+      <li>三级重载引擎：E1 标准 redefine / E2 增强 redefine / E3 generation 降级</li>
+      <li>字节码分析：精确识别方法体变更 vs 结构变更，避免不必要的 Bean 重建</li>
+      <li>Spring AOP 自动适配：通用 advisor 重算机制，支持任意自定义切面注解</li>
+      <li>私有字段访问桥接：Generation 子类通过 MethodHandles 穿透父类 private 字段</li>
+      <li>会话文件并发保护：文件锁保护多 IDEA 窗口的 sessions.json 写入</li>
+    </ul>
+
+    <h3>使用方式</h3>
+    <ol>
+      <li>安装插件并重启 IDEA</li>
+      <li>可选：Settings | Tools | Debug Hot Reload 调整项目范围、功能开关与诊断设置</li>
+      <li>用 <b>Debug</b> 模式启动 Spring Boot 应用（增强引擎自动检测并启用）</li>
+      <li>修改代码或配置文件后编译（Ctrl+F9），在底部工具窗口查看热重载结果</li>
+    </ol>
+
+    <h3>兼容性</h3>
+    <ul>
+      <li>IDEA：2024.3+</li>
+      <li>JDK：8/11/17/21（推荐 DCEVM-8 或 JetBrains Runtime 用于增强引擎）</li>
+      <li>框架：Spring Boot 2.x/3.x、MyBatis 3.x、MyBatis-Plus 3.x</li>
+    </ul>
+  ]]></description>
+  <change-notes><![CDATA[
+    <b>1.0.0 — 首个正式基线</b>
+    <p>面向 IDEA Debug 场景提供完整、可配置且可诊断的 Java/Spring/MyBatis 全栈热更新能力。</p>
+
+    <h4>核心能力</h4>
+    <ul>
+      <li><b>三级重载引擎</b>：E1 标准 redefine、E2 DCEVM/JBR 增强 redefine、E3 generation 降级</li>
+      <li><b>Java 与 Spring</b>：方法体、结构和注解变更，以及依赖注入、MVC、AOP、事务、安全与 Jackson 缓存刷新</li>
+      <li><b>Mapper XML</b>：支持 MyBatis/MyBatis-Plus 语句与映射变更，多 Configuration 原子提交和失败回滚</li>
+      <li><b>配置文件</b>：在原 Spring 属性源优先级处安全更新 properties/YAML</li>
+      <li><b>静态资源</b>：HTML/CSS/JS/JSON、图片和字体的新增、修改、删除、移动与目录重命名安全同步</li>
+      <li><b>作用范围</b>：全局默认、项目级覆盖、四类功能独立开关和 Debug 运行配置排除</li>
+      <li><b>诊断能力</b>：环境探测、中文日志、四态结论、日志级别及容量配置</li>
+    </ul>
+
+    <h4>可靠性</h4>
+    <ul>
+      <li>按有序 Debug classpath 精确路由，识别同名类和静态资源遮蔽</li>
+      <li>稳定文件读取、大小限制、路径包含检查、符号链接拒绝及写入后校验</li>
+      <li>多 Debug 会话隔离、请求鉴权、队列背压和会话异常恢复</li>
+      <li>静态资源仅同步输出目录并清理 Spring MVC 缓存，不调用 LiveReload、模板引擎、浏览器或其他 UI 控件</li>
+    </ul>
+  ]]></change-notes>
+  <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.modules.java</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <java.programPatcher implementation="dev.hotreload.idea.run.DebugProgramPatcher" order="first" />
+    <applicationService serviceImplementation="dev.hotreload.idea.settings.HotReloadSettings" />
+    <projectService serviceImplementation="dev.hotreload.idea.settings.ProjectHotReloadSettings" />
+    <projectConfigurable parentId="tools"
+                         id="dev.hotreload.idea.settings"
+                         displayName="Debug Hot Reload"
+                         instance="dev.hotreload.idea.settings.HotReloadConfigurable" />
+    <projectService serviceImplementation="dev.hotreload.idea.logging.HotReloadLogBuffer" />
+    <projectService serviceImplementation="dev.hotreload.idea.client.HotReloadProjectService" />
+    <toolWindow id="Debug Hot Reload"
+                anchor="bottom"
+                factoryClass="dev.hotreload.idea.ui.HotReloadLogToolWindowFactory"
+                canCloseContents="false" />
+  </extensions>
+</idea-plugin>
+
+
+

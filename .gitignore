@@ -1,0 +1,13 @@
+.gradle/
+.gradle-user-home/
+build/
+**/build/
+out/
+*.iml
+.idea/
+.idea-platform-2025/
+.intellijPlatform/
+hs_err_pid*.log
+replay_pid*.log
+*.hprof
+.DS_Store
